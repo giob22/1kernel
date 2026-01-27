@@ -102,7 +102,108 @@ Le opzioni clang specificate dalla variabile `CFLAGS` sono le seguenti:
 
 SBI è una "API per il sistema operativo". Per chiamare SBI e utilizzare la sua funzione, utilizziamo l'istruzione `ecall`.
 
-.
+### firmware
+
+Il firmware è un tipo particolare di software che è "scritto nel ferro". Mentre il kernel può essere aggiornato o cambiato facilmente, il firmware è solitamente fornito dal produttore della scheda madre o dalla CPU.
+
+Il suo compito è quello di:
+
+- Inizializzare l'hardware: quando si accende la CPU, questa non sa nemmeno di avere la RAM. Il firmware è il primo codice che gira e configura i vari componenti.
+- Preparare il campo per il OS: una volta configurato l'hardware, il firmware cerca il kernel, lo carica in memoria e lo avvia.
+- Fornire servizi critici: anche dopo l'avvio, rimane residente in memoria per gestire compiti che il kernel non può o non deve gestire.
+
+Quindi nei sistemi moderni la distinzioni tra le modalità di esecuzione non è più quella tra kernel mode e user mode, ma ci sono tre livelli:
+
+- User mode
+- Kernel mode
+- Machine mode
+
+---
+
+OpenSBI è quindi il firmware e attraverso la sua interfaccia, SBI, il kernel può chiedere di gestire delle funzionalità.
+
+La funzione `sbi_call` cosa fa tecnicamente:
+
+- registri specifici: il protocollo SBI stabilisce che i parametri devono stare nei registri da `a0` a `a5`, l'ID della funzione in `a6` e l'ID dell'estensione in `a7`.
+- l'istruzione `ecall`: è l'istruzione fondamentale. Quando la CPU incontra `ecall`, mette in pausa il kernel e salta all'indirizzo dell'OpenSBI.
+- il ritorno: dopo aver eseguito il compito, l'OpenSBI mette il risultato nei registri `a0` (errore) e `a1` (valore) e restituisce il controllo al kernel.
+
+### differenza tra Estensione EID e Funzione FID
+
+L'interfaccia SBI è modulare. Non è un unico blocco di funzioni, ma una collezioni di "pacchetti" (estensioni).
+
+- EID: identifica la categoria della chiamata. Dice a OpenSBI a quale modulo appartiene la richiesta.
+- FID: identifica la sottofunzione specifica all'interno del modulo specificato da EID.
+
+---
+
+Con le istruzioni `register long a0 __asm__("a0") = arg0;` stiamo dando ordini precisi al compilatore su come usare l'hardware della CPU.
+
+In C standard, di solito non ci interessa dove il compilatore salva una variabile. Ma quando dobbiamo fare una SBI call, il protocollo è rigido: i dati devono trovarsi in registri specifici prima di lanciare l'istruzione `ecall`.
+
+La sintassi `register long a0 __asm__("a0") = arg0` di divide in tre parti:
+
+- `register`: è il suggerimento al compilatore di inserire questa variabile nei registri e non nello stack.
+- `__asm__("a0")`: questo è il comando cruciale. Dice al compilatore di non scegliere un registro a caso ma deve usare il registro fisico `a0`.
+- `= arg0` copia il valore del parametro della funzione dentro quel registro.
+
+Nella chiamata `ecall` ci sono inoltre altre informazioni che dobbiamo dare al compilatore riguardanti i registri della CPU.
+
+La struttura segue tale schema: `__asm__ ("codice" : output : input : clobber);`
+
+1) output operands: `"=r"(a0), "=r"(a1)`
+   
+   Questa prima parte dice al compilatore che l'istruzione `ecall`, in questo caso, termina i valori di output sono inseriti all'interno dei registri specificati.
+
+   - `=` indica che il registro viene scritto, è un output
+   - `r` indica che deve usare un registro
+2) input operands: `"r"(a0), "r"(a1), ..., "r"(a7)`
+   
+   Qui invece stiamo dicendo al compilatore quali variabili devono essere pronte prima di eseguire `ecall`.
+
+   Quindi stiamo evitando che i registri necessari all'esecuzione della `ecall` siano modificati.
+3) clobber list: `memory`
+   
+   Questo è un avvertimento fondamentale per l'ottimizzazione del compilatore.
+
+   - `memory` dice al compilatore che la funzione potrebbe utilizzare la memoria RAM, quindi sporcare il contenuto dello stack.
+
+## `common.h`
+
+Il contenuto di `common.h` riguarda delle definizioni e dei prototipi di funzione da esporre alle applicazioni utente che fanno uso di tale libreria.
+
+La parte più importante riguarda le definizioni, infatti sono presenti:
+
+```c
+#define va_list __builtin_va_list
+#define va_start __builtin_va_start
+#define va_end __builtin_va_end
+#define va_arg __builtin_va_arg
+```
+
+Nella costruzione di un kernel non possiamo utilizzare libreria standard del C (`stdio.h`), quindi dobbiamo definire un modo per gestire i parametri extra nel caso di funzioni **variadiche**, ovvero funzioni che accettano una lista variabile di argomenti.
+
+Invece di scrivere codice assembly complesso per estrarre i parametri dallo stack, si usano delle scorciatoie fornite dal compilatore.
+
+|Macro|Cosa fa|
+|:---|:---|
+|`va_list`|Il cursore. Serve per creare la variabile che farà da puntatore o cursore corrente.|
+|`va_start`|Il punto di partenza. Inizializza il cursore: `va_start(cursore, ultimo_argomento_fisso)`.|
+|`va_arg`|Leggi e avanza. Cuore del meccanismo, legge il valore alla posizione attuale del cursore interpretandolo rispetto al tipo specificato.|
+|`va_end`|Segnala che abbiamo finito di leggere gli argomenti. Spesso questa macro non fa nulla o imposta il puntatore a NULL.|
+
+Tutte le macro puntano a qualcosa che inizia con `__builtin_`. Questo accade perché la gestione degli argomenti variabili dipende totalmente dall'architettura della CPU. In RISC-V:
+
+- i primi 8 argomenti vanno nei registri, gli altri vanno nello stack
+- il compilatore sa esattamente dove sono finiti. Usando `__builtin_`, chiediamo al compilatore di generare il codice specifico per andare a recuperare quei valori nel posto giusto senza dover necessariamente conoscere i dettagli dell'assembly.
+
+Queste macro sono necessarie per poter effettivamente stampare una formated string.
+
+
+<!-- todo capisci come funziona la scrittura di una formated string
+      non ho avuto il tempo di vederla bene. Capisci la logica che c'è dietro.
+ -->
+
 
 
 

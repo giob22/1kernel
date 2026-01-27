@@ -14,7 +14,7 @@ CFLAGS="-std=c11 -O2 -g3 -Wall -Wextra --target=riscv32-unknown-elf -fuse-ld=lld
 
 # costruiamo il kernel (build)
 $CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
-	kernel.c
+	kernel.c common.c
 
 
 # start qemu

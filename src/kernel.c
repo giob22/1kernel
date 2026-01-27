@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "common.h"
 
 extern char __bss[], __bss_end[], __stack_top[];
 
@@ -44,6 +45,9 @@ void kernel_main(void) {
 	for (int i = 0; s[i] != '\0'; i++){
 		putchar(s[i]);
 	}
+
+	printf("\n\nHello %s\n", "World");
+	printf("\n\n1 + 2 = %d, %x\n", 1 + 2, 0x1234abcd);
 
 
 	// idle loop
