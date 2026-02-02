@@ -199,11 +199,70 @@ Tutte le macro puntano a qualcosa che inizia con `__builtin_`. Questo accade per
 
 Queste macro sono necessarie per poter effettivamente stampare una formated string.
 
+### Nella funzione `printf()`
 
-<!-- todo capisci come funziona la scrittura di una formated string
-      non ho avuto il tempo di vederla bene. Capisci la logica che c'è dietro.
- -->
+Nel caso di `%d` dobbiamo far attenzione quando `value` è un numero negativo.
+
+Il motivo del pericolo sta nel fatto che l'intervallo di rappresentazione dei numeri interi non è simmetrico, ciò significa che la quantità di numeri negativi è maggiore rispetto i positivi se escludiamo lo zero dal conteggio.
+
+Quindi quando voglio stampare il numero negativo più piccolo possibile, non posso stampare il `-` e successivamente lavorare con lo stesso numero ma cambiato di segno.
+
+
+L'intervallo di rappresentazione per un intero su `4byte`:
+
+$$[-2.147.483.648; -2.147.483.647]$$
+
+Significa che se `value = -2.147.483.648`, allora non posso fare `value = -value`, altrimenti andremo in *overflow*.
+
+Utilizzando invece `unsigned magnitude` non ho problemi per rappresentare tale numero. Ovviamente le variabili `unsigned` non rappresentano i numeri in complemento a 2, come avviene per i numeri interi.
+
+Questo significa che se faccio `unsigned magnitude = -1`:
+
+- `-1` in complemento a 2 equivale a `11111111111111111111111111111111`
+- `magnitude`, mantiene valori rappresentati in binario; il corrispondente valore a quella sequenza di bit sarà: `4.294.967.295`
+
+Una volta ottenuto questo risultato su `magnitude`, posso nuovamente moltiplicare per `-1` il risultato.
+
+Eseguendo la moltiplicazione in complemento a 2 ottengo: `(-4.294.967.295)`$_{10}$ = `(00000000000000000000000000000001)`$_{2}$.
+
+Tale numero nella rappresentazione binaria è pari a `1`. Quindi ottengo il valore che stavo cercando.
+
+Questo metodo quindi è comodo per evitare *overflow* dovuto al fatto che l'intervallo di rappresentazione non è simmetrico
 
 
 
+## capitolo 6
+
+Essendo che non possiamo utilizzare funzioni della libreria C standard, implementiamo da 0 alcune delle più utili.
+
+- `paddr_t`: un tipo che rappresenta gli indirizzi di memoria fisici.
+- `vaddr_t`: un tipo che rappresenta gli indirizzi di memoria virtuale. Equivalente a `uintptr_t` nella libreria standard.
+- `align_up`: arrotonda `value` al multiplo più vicino di `align`. `align` deve essere una potenza di 2.
+- `is_aligned`: varifica se `value` è un multiplo di `align`. `align` deve essere una potenza di 2.
+- `offsetof`: restituisce l'offset di un membro all'interno di una struttura, ovvero il numero di byte dall'inizio della struttura in cui è posizionato il membro.
+
+`align_up` e `is_aligned` sono utili quando si gestisce l'allineamento della memoria. Ad esempio, `align_up(0x1234, 0x1000)` restituisce `0x2000`.
+
+Inoltre, `is_aligned(0x2000,0x1000)` restituisce `true`, ma `is_aligned(0x2f00, 0x1000)` restituisce `false`.
+
+
+<!-- ! continua a vedere il capitolo 7 per bene -->
+
+## kernel panic
+
+Se definissimo il kernel panic come una funzione `__LINE__` e `__FILE__` mostrerebbero il nome del file e il numero di riga in cui è definita la funziona chiamata.
+
+Invece definendola come macro questa ci fornisce effettivamente informazioni sulla posizione dell'errore che ha mandato in panico il kernel.
+
+La macro consta di due costrutti C che sono il `do while` e il `while`.
+
+Il primo ciclo `while(0)`, viene eseguito una sola volta. Questo è un modo comune per definire macro composte da più istruzioni.
+
+Racchiudere semplicemente tra `{ ... }` può portare a comportamenti indesiderati se combinato con istruzioni come `if`.
+
+Inoltre, si noti la `\` alla fine di ogni riga. Sebbene la macro sia definita su più righe, i caratteri di nuova riga vengono ignorati quando espansa.
+
+Il secondo idioma `#__VA_ARGS__`. Si tratta di un'utile estensione del compilatore per definire macro che accettano un numero variabile di argomenti. `##` rimuove il precedente `,` quando gli argomenti variabili sono vuoti.
+
+Questo consente la compilazione anche quando è presente un solo argomento, come `PANIC("booted!")`.
 
