@@ -246,7 +246,6 @@ Essendo che non possiamo utilizzare funzioni della libreria C standard, implemen
 Inoltre, `is_aligned(0x2000,0x1000)` restituisce `true`, ma `is_aligned(0x2f00, 0x1000)` restituisce `false`.
 
 
-<!-- ! continua a vedere il capitolo 7 per bene -->
 
 ## kernel panic
 
@@ -265,4 +264,37 @@ Inoltre, si noti la `\` alla fine di ogni riga. Sebbene la macro sia definita su
 Il secondo idioma `#__VA_ARGS__`. Si tratta di un'utile estensione del compilatore per definire macro che accettano un numero variabile di argomenti. `##` rimuove il precedente `,` quando gli argomenti variabili sono vuoti.
 
 Questo consente la compilazione anche quando è presente un solo argomento, come `PANIC("booted!")`.
+
+## capitolo 8 (Exception)
+
+L'eccezione è una funzionalità della CPU che consente al kernel di gestire vari eventi, come accessi alla memoria non validi (page fault), istruzioni illegali e chiamate di sistema.
+
+L'eccezione è simile ad un meccanismo `try-catch` assistito dall'hardware in c++ o java.
+
+Finché la CPU non incontra la situazione in cui è richiesto l'intervento del kernel, continua ad eseguire il programma.
+
+La differenza fondamentale rispetto `try-catch` è che il kernel può riprendere l'esecuzione dal punto in cui si è verificata l'eccezione, come se nulla fosse accaduto.
+
+Le eccezioni possono essere attivate anche in kernel mode e nella maggior parte dei casi si tratta di bug fatali del kernel.
+
+Se QEMU si resetta inaspettatamente o il kernel non funziona come previsto, è probabile che si sia verificata un'eccezione.
+
+È consigliato implementare un gestore delle eccezioni in anticipo per evitare crash in modo corretto in caso di kernel panic.
+
+### vita di una eccezione
+
+In RISC-V, un eccezione verrà gestita come segue:
+
+1) la CPU controlla il registro `medeleg` per determinare quale modalità operativa debba gestire l'eccezione.
+  
+  Utilizzando OpenSBI, questo è già configurato per gestire le eccezioni U-mode e S-mode nel gestore S-mode.
+
+2) La CPU salva il suo stato in vari **CSR**
+3) Il valore del registro `stvec` viene impostato sul *program* *counter*, saltando al gestore delle eccezioni del kernel.
+4) Il gestore delle eccezioni salva i registri di uso generale e gestisce l'eccezione.
+5) Una volta completata l'operazione, il gestore delle eccezioni ripristina lo stato di esecuzione salvato e richiama l'istruzione `sret` per riprendere l'esecuzione dal punto in cui si è verificata l'eccezione.
+
+Le richieste di risposta al client (CSR) aggiornate nel passaggio 2 sono principalmente le seguenti.
+
+L'eccezione del kernel determina le azioni necessarie in base alle richieste di risposta al client (CSR).
 
