@@ -298,3 +298,483 @@ Le richieste di risposta al client (CSR) aggiornate nel passaggio 2 sono princip
 
 L'eccezione del kernel determina le azioni necessarie in base alle richieste di risposta al client (CSR).
 
+---
+
+CSR: *control status register* sono fondamentali perché rappresentano il "pannello di controllo" della CPU, in particolare per l'architettura **RISC-V**.
+
+**A cosa servono**:
+
+I CSR permettono al sistema operativo di interagire con l'hardware per compiti che vanno oltre alla semplice matematica. Come ad esempio:
+
+- gestione delle eccezioni e interrupt: sapere perché il programma è crashato o gestire un timer.
+- privilegi: passare dalla modalità utente alla modalità kernel.
+- memoria virtuale: configurare dove si trova la tabella delle pagine.
+- informazioni di sistema: leggere l'ora esatta o il numero di cicli di clock eseguiti.
+
+In questo caso vengono utilizzati per le eccezioni.
+
+I più importanti sono:
+
+- `stvec` (supervisor trap vector base address): contiene l'indirizzo della funzione che il kernel deve eseguire quando si verifica un'eccezione.
+- `scause` (supervisor cause): indica il motivo dell'eccezione.
+- `sepc` (supervisor exception program counter) salva l'indirizzo dell'istruzione che era in esecuzione quando è avvenuta l'eccezione, così il kernel sa dove tornare una volta finito il lavoro.
+- `sscratch`: registro "jolly" usato per salvare temporaneamente un valore.
+- `stval`: informazioni aggiuntive sull'eccezione.
+- `sstatus`: modalità operativa quando l'eccezione si è verificata.
+
+---
+
+Il punto di ingresso del gestore dell'eccezione sarà inserito all'intero del registro `stvec`.
+
+Utilizziamo la macro `__attribute__((aligned(4)))` per far in modo che l'indirizzo associato alla entry point sia un multiplo di 4.
+
+A cosa serve?
+
+- La CPU RISC-V legge le istruzioni a blocchi. Se il processore cerca di caricare un'istruzione a 32bit da un indirizzo che non è divisibile per 4, la CPU solleverà un eccezione chiamata **Instruction Address Misaligned**.
+
+Nel punto di ingresso viene chiamata la seguente funzione: `handle_trap`. Per gestire l'eccezione in linguaggio C.
+
+---
+
+Spiegazione di ciò che accade in `kernel_entry`:
+
+- Salvataggio del contesto:
+  
+  quando entriamo qui, i registri della CPU contengono i valori del programma che è stato interrotto. Dobbiamo salvarli in modo che il programma non capisca che effettivamente è stato eseguito il kernel.
+
+  Quindi il programma non sà che i propri registri potrebbero esser stati sporcati.
+
+  ```asm
+  csrw sscratch, sp
+  addi sp, sp, -4 * 31
+  ```
+
+  - `csrw` salva il valore attuale dello stack pointer (`sp`) nel registro speciale `sscratch`.
+
+   Il motivo sta nel fatto che modificheremo lo stack, quindi non vogliamo perdere il punto originale.
+
+  - `addi` crea sullo stack dello spazio dove verrà salvato tutto.
+  
+  ```asm
+  sw ra,  4 * 0(sp)
+  sw gp,  4 * 1(sp)
+  ...
+  sw s11, 4 * 29(sp)
+  ```
+
+  - `sw` (store word): copia il contenuto di ogni registro nello spazio che abbiamo creato sullo stack. 
+  
+  infine abbiamo:
+
+  ```asm
+  csrr a0, sscratch
+  sw a0, 4 * 30(sp)
+  ```
+
+  Salviamo il vecchio `sp`, che avevamo inserito in `sscratch` nell'ultimo spazio libero sullo stack.
+
+  Abbiamo infine tutti i registri salvati in memoria.
+- Chiamata al gestore in C
+  
+  ```asm
+  mv a0, sp
+  call handle_trap
+  ```
+  - `mv` copia l'indirizzo attuale dello stack nel registro `a0`. In C, `a0` è il primo argomento di una funzione.
+  - `call handle_trap` salta alla funzione C `handle_trap`. Qui il kernel analizzerà l'accaduto e deciderà cosa fare.
+- Ripristino del contesto
+  
+  Quando `handle_trap` termina, dobbiamo rimettere tutto a posto come se nulla fosse successo.
+
+  ```asm
+  lw ra,  4 * 0(sp)
+  ...
+  lw s11, 4 * 29(sp)
+  lw sp,  4 * 30(sp)
+  ```
+
+  - `lw` (load word) prende il valore dalla memoria (stack) e li rimette nei registri della CPU.
+  - L'ultima istruzione è cruciale, ripristina lo stack pointer originale, eliminando di fatto lo spazio cha avevamo creato per memorizzare i registri.
+- Ritorno final
+  
+  ```asm
+  sret
+  ```
+
+  - `sret` (supervisor return) non è una normale `ret`, infatti:
+  
+  1) Torna all'indirizzo salvato nel registro `sepc` (prima dell'interruzione del programma)
+  2) Ripristina la modalità di privilegio precedente
+  3) Riabilita gli interrupt
+
+
+Dobbiamo definire le macro e le strutture che stiamo utilizzando in `kernel.h`.
+
+In particolare:
+
+```c
+#define  READ_CSR(reg) \
+	({ \
+		unsigned long __tmp; \
+		__asm__ __volatile__ ("csrw " #reg ", %0" :: "r"(__tmp)); \
+		__tmp; \
+	})
+```
+
+è la macro che mi permette di leggere il valore di CSR e di restituirlo al codice C.
+
+È una **Statement Expression** (`({ ... })`), ovvero un estensione di GCC che permette di mettere un blocco di codice dentro un'espressione. L'ultima riga `__tmp;` diventa il valore di ritorno del blocco.
+
+--- 
+
+La `trap_frame` rappresenta lo stato del programma salvato in `kernel_entry`.
+
+L'ultima cosa che dobbiamo fare è dire alla CPU dove si trova il gestore delle eccezioni. Si fa impostando il registro `stvec` nella funzione `kernel_main`.
+
+## memory allocation
+
+Definiamo un semplice allocatore di memoria. Prima di allocare memoria è necessario definire la regione di memoria che l'allocatore deve gestire.
+
+```linker
+. = ALIGN(4096);
+__free_ram = .;
+. += 64 * 1024 * 1024; /* 64MB */
+__free_ram_end = .;
+```
+
+Questo aggiunge nuovi simboli: `__free_ram` e `__free_ram_end`.
+
+Stiamo definendo un'area di memoria dopo lo spazio dello stack. La dimensione dello spazio è un valore arbitrario e `. = ALIGN(4096)` garantisce che sia allineato a un confine di `4KB`.
+
+I sistemi operativi su `x86-64` determinano le regioni di memoria disponibili ottenendo informazioni dall'hardware al momento dell'avvio (ad esempio, `GetMemoryMap` di UEFI).
+
+### algoritmo di allocazione
+
+Invece di allocare in byte, come il `malloc`, alloca un'unità più grande chiamata "pagina". 1 pagina è tipicamente `4KB`.
+
+La funzione `alloc_pages` alloca dinamicamente `n` pagine di memoria e restituisce l'indirizzo di partenza.
+
+- `netx_paddr` è definito come una variabile statica. Ciò significa che, a differenza delle variabili locali, il suo valore viene mantenuto tra una chiamata di funzione e la successiva.
+  
+  Indica l'indirizzo di inizio della prossima area da assegnare. Quando si assegna, `next_paddr` viene avanzata dalla dimensione assegnata.
+
+  Inizialmente tale variabile ha l'indirizzo `__free_ram`. Questo significa che la memoria viene assegnata in sequeza a partire da `__free_ram`.
+
+  Essendo che la `__free_ram` è allineata su un confine di `4KB`, come abbiamo definito nel linker script, la funzione `alloc_pages` restituisce sempre un indirizzo allienato.
+
+  Se cerca di allocare oltre `__free_ram_end` si verifica un kernel panic.
+
+- `memset` garantisce che l'area di memoria allocata sia sempre riempita da zeri. Questo serve ad evitare problemi difficili da debug causati da memoria non inizializzata.
+
+Tutta via con questo algoritmo non abbiamo la possibilità di liberare la memoria allocata. Quindi dovremmo implementare altri algoritmi che ci permettono di gestire ciò, come il buddy system.
+
+
+## process
+
+Un processo è un'istanza di un'applicazione. Ogni processo ha un proprio contesto di esecuzione e risorse indipendenti, come uno spazio di indirizzamento virtuale.
+
+Molti sistemi operativi forniscono il contesto di esecuzione come un concetto separato, chiamto *thread*. Per semplicità utilizziamo processi che hanno un unico thread, ovvero un unico contesto di esecuzione.
+
+Definiamo il Process Control Block (PCB).
+
+```c
+#define PROCS_MAX 8       // Maximum number of processes
+
+#define PROC_UNUSED   0   // Unused process control structure
+#define PROC_RUNNABLE 1   // Runnable process
+
+struct process {
+    int pid;             // Process ID
+    int state;           // Process state: PROC_UNUSED or PROC_RUNNABLE
+    vaddr_t sp;          // Stack pointer
+    uint8_t stack[8192]; // Kernel stack
+}
+```
+
+Lo stack del kernel contiene registri CPU salvati, indirizzi di ritorno e variabili globali. Preparando uno stack kernel per ogni processo, possiamo implementare il context switching salvando e ripristinando i registri della CPU e cambiando il puntatore dello stack.
+
+> Esiste un altro approccio chiamato "single kernel stack". Invece di avere uno stack kernel per ogni processo, c'è un solo stack per CPU.
+>
+> Cerca *stackless async* se interessa.
+
+La funzione `switch_context` implementa il cambio di contesto.
+
+Infatti questa salva i registri del chiamante sullo stack, cambia il puntatore dello stack e poi carica i registri presenti sul nuovo stack.
+
+---
+
+Motivo per cui abbiamo salvato solo 13 registri dei 31 che abbiamo salvato durante il `kernel_entry`.
+
+- Regola dell'ABI (Application Binary Interface)
+   
+   In RISC-V, i registri sono divisi in due categorie:
+
+   - Caller-Saved (Temporanei): `t0`-`t6`, `a0`-`a7`.
+     - Chi chiama una funzione, se vuole preservare questi registri, deve salvarli prima di fare la chiamata. La funzione chiamata, quindi, può sovrascriverli liberamente.
+
+        Il salvataggio di tali registri è gestito dal compilatore.
+   - Callee-Saved (Preservati): `s0`-`s11`, `sp`
+     - Il chiamato se vuole utilizzare tali registri allora è costretto a salvarli e ripristinarli alla fine. Chi chiama la funzione si aspetta di ritrovarli intatti.
+
+---
+
+Implementiamo una funzione di inizializzazione del processo: `create_process`. Prende il punto di ingresso come parametro e restituisce un puntatore allo `struct process` creato.
+
+### `create_process`
+
+Prepara un nuovo processo per eseguire
+
+La parte in cui operiamo sullo stack consiste nel creare un contesto fittizio per ingannare la funzione `switch_context`.
+
+Infatti cosa fa la funzione `switch_context`:
+
+1) salva i registri del vecchio processo
+2) scambia lo stack pointer
+3) carica 13 valori dallo stack del nuovo processo nei registri
+4) esegue `ret`
+
+Il problema è che un nuovo processo, che non ha mai eseguito prima, non ha registri salvati. Per questo per evitare che nei registri finisca spazzatura, quello che si trova nello stack, o memoria non valida, si realizza un contesto fittizio.
+
+Vediamo cosa accade:
+
+- impostiamo `sp` alla fine dell'array dello stack, ovvero il punto più in alto in memoria.
+- riempie lo stack con 12 zeri
+- infine la riga più importante: `*--sp = (uint8_t) pc; //ra`
+  
+  Stiamo mettendo il valore `pc` nella posizione dove `switch_context` si aspetta di trovare il **Return Address** (`ra`).
+
+Una volta fatto ciò si riempiono i campi contenuti all'interno della struttura `struct process` che identificano il singolo processo e il suo contesto di esecuzione.
+
+### TEST
+
+implementiamo due processi che eseguiranno simultaneamente
+
+```c
+void delay(void){
+	for (int i = 0; i < 30000000; i++){
+		__asm__ __volatile__("nop"); // non fare nulla
+	}
+}
+
+struct process *proc_a;
+struct process *proc_b;
+
+
+void proc_a_entry(void){
+	printf("starting process A\n");
+	while (1) {
+		putchar('A');
+		switch_context(&proc_a->sp, &proc_b->sp);
+		delay();
+	}
+}
+void proc_b_entry(void){
+	printf("starting process B\n");
+	while (1) {
+		putchar('B');
+		switch_context(&proc_b->sp, &proc_a->sp);
+		delay();
+	}
+}
+```
+
+Questi saranno i due processi che intercalano la loro esecuzione sul processore.
+
+Nel `kernel_main` dobbiamo quindi creare questi due processi:
+
+```c
+void kernel_main(void) {
+    memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+
+    WRITE_CSR(stvec, (uint32_t) kernel_entry);
+
+    proc_a = create_process((uint32_t) proc_a_entry);
+    proc_b = create_process((uint32_t) proc_b_entry);
+    proc_a_entry();
+
+    PANIC("unreachable here!");
+}
+```
+
+il risultato dell'esecuzione sarà:
+
+```bash
+make run
+
+starting process A
+Astarting process B
+BABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAQE
+```
+
+## scheduler
+
+Non possiamo eseguire i vari processi come abbiamo fatto prima, in cui erano i processi stessi a passare l'esecuzione ai successivi.
+
+Deve esserci una funzionalità del kernel che permette di eseguire questo servizio in modo trasparente dal punto di vista dei processi.
+
+Ovvero c'è la necessità di implementare uno *scheduler*, un programma del kernel che decide il processo successivo.
+
+Implementiamo la funzione di `yield`.
+
+`yield` viene spesso utilizzata come nome per un'API che consente di cedere volontariamente la CPU a un altro processo.
+
+Abbiamo introdotto due variabili globali: `current_proc` che indica il processo attualmente in corso, `idle_proc` che si riferisce al processo idle, che è "il processo da eseguire quando non ci sono processi eseguibili".
+
+L' `idle_proc` viene creato all'avvio come processo con PID pari a `0`.
+
+Dentro `kernel_main` è presente la sua creazione, è un processo di sistema.
+
+>La funzione `yield` consiste in rilascio volontario della CPU di un processo a favore degli altri pronti ad eseguire.
+
+Possiamo notare che l'algoritmo di scheduling si basa su una politica FCFS.
+
+### modifiche nel gestore delle eccezioni
+
+Nel gestore delle eccezioni, salva lo stato di esecuzione sullo stack. Tuttavia, dato che ora usiamo kernel stack separati per ogni processo, dobbiamo aggiornarlo leggermente.
+
+Qui la vecchia versione: 
+
+```c
+__attribute__((naked)) // per evitare che il compilatore modifichi le istruzioni per ottimizzarle
+__attribute__((aligned(4))) // per assicurarsi che l'entry point della funzione sia un multiplo di 4
+void kernel_entry(void){
+	__asm__ __volatile__(
+		"csrw sscratch, sp\n"
+		"addi sp, sp, -4 * 31\n"
+		
+		"sw ra,  4 * 0(sp)\n"
+		"sw gp,  4 * 1(sp)\n"
+		"sw tp,  4 * 2(sp)\n"
+		"sw t0,  4 * 3(sp)\n"
+		"sw t1,  4 * 4(sp)\n"
+		"sw t2,  4 * 5(sp)\n"
+		"sw t3,  4 * 6(sp)\n"
+		"sw t4,  4 * 7(sp)\n"
+		"sw t5,  4 * 8(sp)\n"
+		"sw t6,  4 * 9(sp)\n"
+		"sw a0,  4 * 10(sp)\n"
+		"sw a1,  4 * 11(sp)\n"
+		"sw a2,  4 * 12(sp)\n"
+		"sw a3,  4 * 13(sp)\n"
+		"sw a4,  4 * 14(sp)\n"
+		"sw a5,  4 * 15(sp)\n"
+		"sw a6,  4 * 16(sp)\n"
+		"sw a7,  4 * 17(sp)\n"
+		"sw s0,  4 * 18(sp)\n"
+		"sw s1,  4 * 19(sp)\n"
+		"sw s2,  4 * 20(sp)\n"
+		"sw s3,  4 * 21(sp)\n"
+		"sw s4,  4 * 22(sp)\n"
+		"sw s5,  4 * 23(sp)\n"
+		"sw s6,  4 * 24(sp)\n"
+		"sw s7,  4 * 25(sp)\n"
+		"sw s8,  4 * 26(sp)\n"
+		"sw s9,  4 * 27(sp)\n"
+		"sw s10, 4 * 28(sp)\n"
+		"sw s11, 4 * 29(sp)\n"
+		
+		"csrr a0, sscratch\n"
+		"sw a0, 4 * 30(sp)\n"
+		
+		
+		"mv a0, sp\n"
+		"call handle_trap\n"
+		
+		"lw ra,  4 * 0(sp)\n"
+		"lw gp,  4 * 1(sp)\n"
+		"lw tp,  4 * 2(sp)\n"
+		"lw t0,  4 * 3(sp)\n"
+		"lw t1,  4 * 4(sp)\n"
+		"lw t2,  4 * 5(sp)\n"
+		"lw t3,  4 * 6(sp)\n"
+		"lw t4,  4 * 7(sp)\n"
+		"lw t5,  4 * 8(sp)\n"
+		"lw t6,  4 * 9(sp)\n"
+		"lw a0,  4 * 10(sp)\n"
+		"lw a1,  4 * 11(sp)\n"
+		"lw a2,  4 * 12(sp)\n"
+		"lw a3,  4 * 13(sp)\n"
+		"lw a4,  4 * 14(sp)\n"
+		"lw a5,  4 * 15(sp)\n"
+		"lw a6,  4 * 16(sp)\n"
+		"lw a7,  4 * 17(sp)\n"
+		"lw s0,  4 * 18(sp)\n"
+		"lw s1,  4 * 19(sp)\n"
+		"lw s2,  4 * 20(sp)\n"
+		"lw s3,  4 * 21(sp)\n"
+		"lw s4,  4 * 22(sp)\n"
+		"lw s5,  4 * 23(sp)\n"
+		"lw s6,  4 * 24(sp)\n"
+		"lw s7,  4 * 25(sp)\n"
+		"lw s8,  4 * 26(sp)\n"
+		"lw s9,  4 * 27(sp)\n"
+		"lw s10, 4 * 28(sp)\n"
+		"lw s11, 4 * 29(sp)\n"
+		"lw sp,  4 * 30(sp)\n"
+		"sret\n"
+	);
+}
+```
+
+Nuova versione:
+
+Nella versione precedente, il gestore delle eccezioni si limitava ad segnalare un'eccezione e non a gestirle effettivamente.
+
+Quindi in quel caso se scattava un eccezione il kernel andava in `PANIC`.
+
+Ora invece dobbiamo fare in modo di distinguere tra un **errore** e un **evento** **normale** (ad esempio il *timer*).
+
+```c
+__asm__ __volatile__(
+    "csrw sscratch, %[sscratch]\n"
+    :
+    : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+);
+```
+
+Scrive nel registro `sscratch` l'indirizzo della CIMA dello stack del prossimo processo.
+
+Questo serve per la gestione delle eccezioni. Quando il processo `next` sarà in esecuzione, potrebbe verificarsi un interrupt. Quando scatta un interrupt, la CPU salta in `kernel_entry`.
+
+E la prima cosa che fa è:
+
+```asm
+csrw sscratch, sp  ; Scambia sp con sscratch
+```
+
+Poiché il puntatore dello stack si estende verso gli indirizzi più bassi, impostiamo l'indirizzo alla `sizeof(next->stack)`, come valore iniziale dello stack del kernel.
+
+Nella nuova implementazione cambia il modo di operare.
+
+- Prima:
+  
+  ```c
+  csrw sscratch, sp       ; Salva SP in sscratch (backup)
+  addi sp, sp, -4 * 31    ; Alloca spazio sullo stack ATTUALE
+  ```
+
+  Usava lo stesso stack su cui stava girando il programma interrotto.
+
+- Dopo:
+  
+  ```c
+  csrrw sp, sscratch, sp  ; SWAP atomico tra sp e sscratch
+  ```
+
+  Questa istruzione scambia il contenuto di `sp` e `sscratch` in un colpo solo.
+
+  - prima dell'eccezione `sp` puntava allo stack del processo, e `sscratch` conteneva l'indirizzo dello stack del kernel.
+  - dopo l'istruzione `sp` punta al kernel stack, e `sscratch` contiene il vecchio user stack
+  
+  Il risultato sta che non appena entriamo in kernel mode, stiamo già lavorando su una memoria sicura e dedicata al kernel.
+
+La seconda fase consiste nel salvataggio del vecchio `sp` (user).
+
+```c
+csrr a0, sscratch       ; Legge il vecchio SP (che ora è in sscratch dopo lo swap)
+sw a0,  4 * 30(sp)      ; Lo salva nel Trap Frame
+```
+
+Qui stiamo salvando nello stack del kernel il valore che lo stack pointer aveva prima dell'interruzione, questo è fondamentale per poter tornare al processo utente più tardi.
+
+Infine abbiamo la preparazione per una prossima eccezione, ovvero viene riposizionato l'indirizzo del fondo del kernel stack all'interno di `sscratch`.
