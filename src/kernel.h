@@ -13,10 +13,9 @@ struct process {
     int pid;
     int state;
     vaddr_t sp; // stack pointer → indirizzo virtuale
+    uint32_t *page_table;
     uint8_t stack[8192]; // kernel stack
 };
-
-
 
 
 // contenente i 31 indirizzi che abbiamo memorizzato nello stack
@@ -79,4 +78,12 @@ typedef struct {
 	long value;
 } sbiret;
 
+// macro per la page table
+
+#define SATP_SV32 (1u << 31)
+#define PAGE_V (1 << 0) // bit di validità
+#define PAGE_R (1 << 1) // readble
+#define PAGE_W (1 << 2) // writable
+#define PAGE_X (1 << 3) // Executable
+#define PAGE_U (1 << 4) // user (accessibile in user mode)
 

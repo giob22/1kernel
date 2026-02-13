@@ -778,3 +778,241 @@ sw a0,  4 * 30(sp)      ; Lo salva nel Trap Frame
 Qui stiamo salvando nello stack del kernel il valore che lo stack pointer aveva prima dell'interruzione, questo è fondamentale per poter tornare al processo utente più tardi.
 
 Infine abbiamo la preparazione per una prossima eccezione, ovvero viene riposizionato l'indirizzo del fondo del kernel stack all'interno di `sscratch`.
+
+## page table
+
+Fino a questo momento i processi hanno la possibilità di leggere e scrivere nello spazio di memoria del kernel. È davvero poco sicuro ciò.
+
+Dobbiamo implementare quindi un meccanismo che ci permetta di isolare la memoria dedicata ai processi in modo che questi non possano accedere a quella di competenza degli altri processi e del kernel stesso.
+
+Quando un processo accede alla memoria, la CPU traduce l'indirizzo specificato in un indirizzo fisico. La tabella che mappa gli indirizzi virtuali agli indirizzi fisici è chiamata *page table*.
+
+Cambiando la tabella delle pagine, lo stesso indirizzo virtuale può corrispondere a diversi indirizzi fisici. Ciò consente l'isolamento degli spazi di indirizzamento e la separazione delle aree di memoria del kernel e delle applicazioni, migliorando la sicurezza del sistema.
+
+### struttura dell'indirizzo virtuale
+
+Il meccanismo di paging di RISC-V è chiamato Sv32, che utilizza una page table a due livelli. L'indirizzo virtuale a 32bit è suddiviso in un indice di tabella di pagina di primo livello, un indice di secondo livello e un offset di pagina.
+
+[Come funzionano gli indirizzi virtuali in RISC-V](https://riscv-sv32-virtual-address.vercel.app/)
+
+Questa struttura sfrutta il principio di località, permettendo page table più piccole e un uso efficiente della TLB.
+
+Quando accede alla memoria, la CPU calcola `VPN[1]` e `VPN[2]` per identificare la corrispondente voce della tabella delle pagine, legge l'indirizzo fisico base mappato e aggiunge `offset` per ottenere l'indirizzo fisico finale.
+
+### costruzione dalla tabella delle pagine
+
+Costruiamo una tabella delle pagine in Sv32. Per prima cosa, definiremo alcune macro come:
+
+- `SATP_SV32` è un singolo bit nel registro `SATP` che indica "abilita la paginazione in modalità Sv32", e `PAGE_*` sono flag da impostare nelle voci della page table.
+
+La funzione `map_page` ci permette di mappare una pagina all'interno della page table, ha come input: la tabella di pagina di primo livello, l'indirizzo virtuale e i flag di ingresso della tabella della pagina.
+
+Come è suddiviso un indirizzo virtuale:
+
+|Id tabella 1|Id tabella 2|offset|
+|:---:|:---:|:---:|
+|10bit|10bit|12bit|
+
+La funzione `map_page` garantisce che esista la entry della page table di primo livello e poi impostando la entry della page table di secondo livello per mappare una pagina fisica.
+
+Divide `paddr` per `PAGE_SIZE` perché la entry contiene il numero di pagina fisico, non l'indirizzo fisico stesso.
+
+Tale funzione ha il compito di dire alla CPU che l'indirizzo virtuale `x` corrisponde all'indirizzo fisico `y`.
+
+- **Prima esegue un controllo di sicurezza**:
+
+```c
+if (!is_aligned(vaddr, PAGE_SIZE)){
+    PANIC("unaligned vaddr %x", vaddr);
+}
+
+if (!is_aligned(paddr, PAGE_SIZE)){
+    PANIC("unaligned vaddr %x", paddr);
+}
+```
+
+Controlla che entrambi gli indirizzi siano multipli di 4KB. Perché la paginazione lavora su blocchi interi.
+
+Non è possibile mappare pagine a metà. Un indirizzo di pagina deve finire sempre con tre zeri esadecimali.
+
+- **Calcolo dell'indice di livello 1**
+
+Estrae i primi 10 bit significativi dell'indirizzo virtuale, tali bit indicano il numero di pagina.
+
+```c
+uint32_t vpn1  = (vaddr >> 22) & 0x3ff;
+```
+
+Tale valore indica in che riga della page table principale è posizionata la entry corrispondente alla page table di secondo livello che mantiene la corrispondenza tra pagina virtuale e pagina fisica.
+
+- **Controllo e creazione della page table di secondo livello**
+
+```c
+if ((table1[vpn1] & PAGE_V) == 0){
+```
+
+Guarda nella page table principale alla riga `vpn1` e controlla se il bit `PAGE_V` è 0; controlla se è valida o non.
+
+Se è pari ad `1` allora la tabella di secondo livello esiste già, altrimenti se pari a `0` allora dobbiamo creare la entry per la tabella di secondo livello perché questa non esiste.
+
+- **Allocazione della nuova tabella (se il validy bit è pari a 0)**
+
+```c
+uint32_t pt_paddr = alloc_pages(1);
+```
+
+Chiede all'allocatore che abbiamo realizzato di restituire una pagina di RAM da utilizzare come tabella.
+
+`pt_paddr` contiene l'indirizzo fisico di questa nuova pagina
+
+- **Collegamento nella tabella 1**
+
+```c
+table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+}
+```
+
+Scrive nella tabella principale il collegamento alla nuova tabella appena creata.
+
+- `pt_paddr / PAGE_SIZE`: ottiene il PPN (physical page number). Toglie gli ultimi 12 bit (zeri).
+- `<<10`: sposta il PPN nella posizione corretta, i 10bit bassi sono riservati ai flag.
+- `| PAGE_V` accende il bit *validy*.
+- Ora la tabella 1 sa che per quell'indirizzo virtuale deve andare a guardare nella nuova tabella fisica che abbimo appena allocato.
+
+- **Calcolo dell'indice di livello 2**
+
+```c
+uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+```
+
+Estrae i secondi 10 bit dell'indirizzo virtuale.
+
+- **Trova l'indirizzo della tabella 2**
+
+```c
+uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+```
+
+- **La mappatura finale**
+
+```c
+table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+```
+
+Scrive l'indirizzo fisico di destinazione nella tabella di secondo livello.
+
+- `paddr / PAGE_SIZE`: prende il PPN dei dati veri
+- `<<10`: lo sposta in alto per far spazio ai flag
+- `| flags`: aggiunge i permessi richiesti (rwx u)
+- `| PAGE_V`: aggiunge il bit di validità
+
+
+---
+
+La tabella delle pagine deve esser configurata non solo per le applicazioni ma anche per lo stesso kernel.
+
+In questo caso facciamo in modo che gli indirizzi virtuali del kernel corrispondono a quelli fisici (`vaddr == paddr`). Questo permette allo stesso codice di continuare a funzionare anche dopo aver abilitato la paginazione.
+
+---
+
+Modifichiamo il linker script per definire l'indirizzo di partezza usato dal kernel (`__kernel_base`):
+
+```linker
+ENTRY(boot)
+
+SECTIONS {
+    . = 0x80200000;
+    __kernel_base = .;
+```
+
+---
+
+Successivamente, si aggiunge la page table alla struttura del processo. Questo sarà un riferimento alla page table di primo livello.
+
+---
+
+Mappiamo le pagine del kernel nella funzione `create_process`, quelle relative al kernel per ogni processo. Le pagine del kernel vanno da `__kernel_base` a `__free_ram_end`. Questo approccio garantisce che il kernel possa sempre accedere sia alle aree allocate staticamente (come `.text`) sia alle aree allocate dinamicamente gestite da `alloc_pages`.
+
+```c
+extern char __kernel_base[];
+
+struct process *create_process(uint32_t pc) {
+    /* omitted */
+
+	// NEW
+
+    // Map kernel pages.
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+	// END NEW
+
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    proc->page_table = page_table; // NEW
+    return proc;
+}
+```
+
+### switching page tables
+
+Cambiamo la page table del processo quando si esegue un cambio di contesto.
+
+```c
+void yield(void) {
+    /* omitted */
+
+    __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
+        "csrw sscratch, %[sscratch]\n"
+        :
+        // Don't forget the trailing comma!
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
+    switch_context(&prev->sp, &next->sp);
+}
+```
+
+Possiamo cambiare la tabella delle pagine specificando la page table di primo livello in `SATP`. Nota che dividiamo per `PAGE_SIZE` perché è il numero di pagina fisico.
+
+Adesso quando si cambia processo si deve cambiare anche la mappa della memoria.
+
+```c
+csrw satp, %[satp]
+```
+
+Il registro `satp` è il registro più importante per la memoria virtuale in RISC-V. Contiene l'indirizzo della page table di primo livello del processo corrente.
+
+Appena scriviamo in questo registro, la CPU smette di usare la vecchia tabella delle pagine del processo `prev` e inizia a usare quella del nuovo processo `next`.
+
+L'effetto sta che cambia il mapping degli stessi indirizzi virtuali. In questo modo possiamo utilizzare per entrambi i processi gli stessi indirizzi virtuali ma questi saranno mappati in posizioni diverse all'interno della memoria fisica.
+
+```c
+SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)
+```
+
+Prende l'indirizzo fisico della tabella e lo divide per `PAGE_SIZE`. Questo ci dà il PPN. Il registro `satp` infatti desidera il PPN e non l'indirizzo fisico crudo.
+
+`| SATP_SV32`: attiva il bit 31 (il bit `MODE`). Questo accende la Memory Management Unit (MMU). Senza questo bit, la paginazione sarebbe spenta e gli indirizzi fisici sarebbero uguali a quelli virtuali.
+
+- `sfence.vma` (pulizia della cache)
+  
+  lo eseguiamo due volte, prima e dopo il cambio di `satp`.
+
+  Il problema: la traduzione degli indirizzi virtuali è lenta perché richiede di leggere la RAM due volte.
+
+  Per essere veloce, la CPU ha una cache speciale chiamata TLB che ricorda le ultime traduzioni fatte.
+
+  `sfence.vma` (supervisor fence virtual memory address) è un comando che dice alla CPU di dimenticare tutto quello che sa sugli indirizzi, ovvero che TLB non è più valida per le traduzioni.
+
+  Si fa prima e dopo la scrittura di `satp` per garantire che nessuna operazione di memoria precedente o successiva usi traduzioni sbagliate.
+
+
+
+

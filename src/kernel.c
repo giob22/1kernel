@@ -1,7 +1,7 @@
 #include "kernel.h"
 #include "common.h"
 
-extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
+extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[], __kernel_base[];
 
 sbiret sbi_call(long arg0,long arg1,long arg2,long arg3,long arg4,long arg5, long fid, long eid);
 
@@ -21,6 +21,9 @@ struct process *idle_proc;	// idle process
 
 void yield(void);
 
+
+// page table stuff
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags);
 
 
 
@@ -73,7 +76,7 @@ void proc_b_entry(void){
 	
 }
 
-
+// * main
 void kernel_main(void) {
 	memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 	
@@ -162,6 +165,35 @@ void putchar(char ch){
 
 
 
+// page table
+
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags){
+	if (!is_aligned(vaddr, PAGE_SIZE)){
+		PANIC("unaligned vaddr %x", vaddr);
+	}
+	
+	if (!is_aligned(paddr, PAGE_SIZE)){
+		PANIC("unaligned vaddr %x", paddr);
+	}
+
+	uint32_t vpn1  = (vaddr >> 22) & 0x3ff;
+
+	if ((table1[vpn1] & PAGE_V) == 0){
+		// crea la entry della prima page table se questa non esiste.
+		uint32_t pt_paddr = alloc_pages(1);
+		table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+	}
+
+	// crea la page table di secondo entry per mappare la pagina fisica
+	uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+	uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+	table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+
+
+
+
 
 // prepara un nuovo processo per eseguire
 struct process *create_process(uint32_t pc){
@@ -194,11 +226,20 @@ struct process *create_process(uint32_t pc){
 	*--sp = 0; // s1
 	*--sp = 0; // s0
 	*--sp = (uint32_t) pc;
+
+
+	// allochiamo le pagine del kernel
+
+	uint32_t * page_table = (uint32_t *) alloc_pages(1);
+	for (paddr_t paddr = (paddr_t) __kernel_base;
+		 paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	 
 	 // inizializziamo i campi del nuovo processo
 	proc->pid = i + 1;
 	proc->state = PROC_RUNNABLE;
 	proc->sp = (uint32_t) sp;
+	proc->page_table = page_table;
 	 
 	return proc;
 }
@@ -223,14 +264,21 @@ void yield(void){
 	
 
 	__asm__ __volatile__(
+		"sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
+
 		"csrw sscratch, %[sscratch]\n"
 		:
-		: [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+		:[satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)), [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
 	);
 
 	// context switch
 	struct process *prev = current_proc;
 	current_proc = next;
+	
+
+
 	switch_context(&prev->sp, &next->sp);
 }
 
