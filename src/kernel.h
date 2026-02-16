@@ -2,7 +2,17 @@
 #include "common.h"
 
 
-// macro e PCB per i processi
+//* User Mode
+
+// l'indirizzo virtuale dell'immagine dell'applicazione.
+// Tale indirizzo deve coincidere con quello definito in `user.ld`.
+
+#define USER_BASE 0x10000000
+
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
+
+
+//* macro e PCB per i processi
 
 #define PROCS_MAX 8
 
@@ -18,7 +28,7 @@ struct process {
 };
 
 
-// contenente i 31 indirizzi che abbiamo memorizzato nello stack
+//* contenente i 31 indirizzi che abbiamo memorizzato nello stack
 struct trap_frame {
     uint32_t ra;
     uint32_t gp;
@@ -78,7 +88,7 @@ typedef struct {
 	long value;
 } sbiret;
 
-// macro per la page table
+//* macro per la page table
 
 #define SATP_SV32 (1u << 31)
 #define PAGE_V (1 << 0) // bit di validità

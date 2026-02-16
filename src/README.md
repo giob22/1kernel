@@ -545,6 +545,100 @@ Vediamo cosa accade:
 
 Una volta fatto ciò si riempiono i campi contenuti all'interno della struttura `struct process` che identificano il singolo processo e il suo contesto di esecuzione.
 
+Ecco l'implementazione della funzione:
+
+<!-- embed:file="kernel.c" line="205-291" lock="true"-->
+```c
+// prepara un nuovo processo per eseguire
+struct process *create_process(uint32_t pc){
+	// find an unused process control structure
+	
+	struct process *proc = NULL;
+	int i = 0;
+	for (i = 0; i < PROCS_MAX; i++){
+		if  (procs[i].state == PROC_UNUSED) {
+			proc = &procs[i];
+			break;
+		}
+	}
+	
+	if (!proc)
+	PANIC("no free process slots");
+	
+	// creiamo un contesto fittizio
+	uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+	*--sp = 0; // s11
+	*--sp = 0; // s10
+	*--sp = 0; // s9
+	*--sp = 0; // s8
+	*--sp = 0; // s7
+	*--sp = 0; // s6
+	*--sp = 0; // s5
+	*--sp = 0; // s4
+	*--sp = 0; // s3
+	*--sp = 0; // s2
+	*--sp = 0; // s1
+	*--sp = 0; // s0
+	*--sp = (uint32_t) pc;
+
+
+	// allochiamo le pagine del kernel
+
+	uint32_t * page_table = (uint32_t *) alloc_pages(1);
+	for (paddr_t paddr = (paddr_t) __kernel_base;
+		 paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+	 
+	printf("\n__kernel_base: %x\n__free_ram_end: %x\n", __kernel_base, __free_ram_end);
+	 // inizializziamo i campi del nuovo processo
+	proc->pid = i + 1;
+	proc->state = PROC_RUNNABLE;
+	proc->sp = (uint32_t) sp;
+	proc->page_table = page_table;
+	 
+	return proc;
+}
+
+// scheduler
+void yield(void){
+	// Ricerca di un processo RUNNABLE
+	
+	struct process *next = idle_proc;
+	
+	for (int i = 0; i < PROCS_MAX; i++){
+		struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+		if (proc->state == PROC_RUNNABLE && proc->pid > 0){
+			next = proc;
+			break;
+		}
+	}
+	
+	// se non ci sono processi RUNNABLE oltre il corrente, ritorna ad eseguire tale processo
+	if (next == current_proc)
+	return;
+	
+
+	__asm__ __volatile__(
+		"sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
+
+		"csrw sscratch, %[sscratch]\n"
+		:
+		:[satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)), [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+	);
+
+	// context switch
+	struct process *prev = current_proc;
+	current_proc = next;
+	
+
+
+	switch_context(&prev->sp, &next->sp);
+}
+```
+<!-- embed:end -->
+
 ### TEST
 
 implementiamo due processi che eseguiranno simultaneamente
@@ -811,7 +905,7 @@ Come è suddiviso un indirizzo virtuale:
 
 |Id tabella 1|Id tabella 2|offset|
 |:---:|:---:|:---:|
-|10bit|10bit|12bit|
+|`10bit`|`10bit`|`12bit`|
 
 La funzione `map_page` garantisce che esista la entry della page table di primo livello e poi impostando la entry della page table di secondo livello per mappare una pagina fisica.
 
@@ -1013,6 +1107,407 @@ Prende l'indirizzo fisico della tabella e lo divide per `PAGE_SIZE`. Questo ci d
 
   Si fa prima e dopo la scrittura di `satp` per garantire che nessuna operazione di memoria precedente o successiva usi traduzioni sbagliate.
 
+---
+
+### esame del contenuto della page table
+
+Da `info registers` possiamo vedere che `satp = 80080243`. Interpretando questo valore possiamo risalire alla posizione fisica della tabella delle pagine.
+
+Da questo valore contenuto in `satp` che corrisponde a `(SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)`, posso ottenere la posizione della page table.
+
+Il PPN è pari a `80243`, moltiplico questo valore per `PAGE_SIZE` e ottengo `80243000`, ovvero l'indirizzo fisico della page table.
+
+All'intero della page table sono interessato a conoscere in che punto si trova il `__kernel_base = 0x80200000`.
+
+Troviamo `vpn0` (livello 2) e `vpn1` (livello 1).
+
+- VPN1: `0x80200000 >> 22 = 512 = 0x200`
+- VPN0: `(0x80200000 >> 12) & 0x3FF = 512 = 0x200`
+
+Dobbiamo visualizzare la 512-esima entry della tabella delle pagine, ovvero `0x80243000 + (512 * 4) = 0x80243800`.
+
+Ottengo come risultato questo:
+
+```bash
+(qemu) xp /1w 0x80243800
+0000000080243800: 0x20091001
+```
+
+Otteniamo la entry corrispondente alla page table di livello 2 che consiste del PPN + il bit di validità in questo caso.
+
+I 10 bit meno significativi corrispondono ai flags, mentre alla restante parte corrisponde il PPN.
+
+Eseguiamo quindi `(0x20091001 >> 10) * 4096 = 0x80244000`
+
+Quindi `0x80244000` corrisponde all'indirizzo fisico della tabella di secondo livello. Anche in questo caso siamo interessati alla `vpn0 = 512` entry.
+
+Quindi andiamo a valutare `xp /1w 0x80244000 + (512 * 4)`:
+
+```bash
+(qemu) xp /1w 0x80244000 + (512 * 4)
+0000000080244800: 0x200800cf
+```
+
+Questo valore corrisponde all'indirizzo fisico + 10 bit bassi corrispondenti ai flag.
+
+Eseguiamo quindi `0x200800cf >> 10 = 0x80200`.
+
+Moltiplicando il valore che abbimo ottenuto per `PAGE_SIZE = 4096` otteniamo l'indirizzo fisico iniziale in cui è presente il kernel ovvero `0x8020000`.
+
+Quindi siamo arrivati ad ottenere l'indirizzo fisico `0x8020000` partendo dall'indirizzo virtuale `0x8020000`.
+
+Abbiamo verificato il mapping manualmente, ma QEMU ci da a disposizione un comando che ci permette di visualizzare il mapping in modo molto più leggibile.
+
+Il comando in questione è `info mem`.
+
+```bash
+(qemu) info mem
+vaddr    paddr            size     attr
+-------- ---------------- -------- -------
+80200000 0000000080200000 00001000 rwx--ad
+80201000 0000000080201000 00001000 rwx----
+80202000 0000000080202000 00001000 rwx--a-
+80203000 0000000080203000 00001000 rwx----
+80204000 0000000080204000 00001000 rwx--ad
+80205000 0000000080205000 00001000 rwx----
+80206000 0000000080206000 00001000 rwx--ad
+80207000 0000000080207000 00009000 rwx----
+80210000 0000000080210000 00001000 rwx--ad
+80211000 0000000080211000 0001f000 rwx----
+80230000 0000000080230000 00001000 rwx--ad
+80231000 0000000080231000 001cf000 rwx----
+80400000 0000000080400000 00400000 rwx----
+80800000 0000000080800000 00400000 rwx----
+80c00000 0000000080c00000 00400000 rwx----
+81000000 0000000081000000 00400000 rwx----
+81400000 0000000081400000 00400000 rwx----
+81800000 0000000081800000 00400000 rwx----
+81c00000 0000000081c00000 00400000 rwx----
+82000000 0000000082000000 00400000 rwx----
+82400000 0000000082400000 00400000 rwx----
+82800000 0000000082800000 00400000 rwx----
+82c00000 0000000082c00000 00400000 rwx----
+83000000 0000000083000000 00400000 rwx----
+83400000 0000000083400000 00400000 rwx----
+83800000 0000000083800000 00400000 rwx----
+83c00000 0000000083c00000 00400000 rwx----
+84000000 0000000084000000 00231000 rwx----
+```
+
+In particolare i flag che non abbiamo visto sono `a` (accesso) e `d` (scritto).
+
+Stiamo vedendo la parte della tabella delle pagine che serve al kernel per funzionare.
+
+### appendice: debugging paging
+
+Impostare le tabelle delle pagine può essere complicato e gli errori possono essere difficili da individuare.
+
+[vedi](https://operating-system-in-1000-lines.vercel.app/en/11-page-table#appendix-debugging-paging)
+
+## application
+
+Prepariamo l'eseguibile della prima applicazione da eseguire sul kernel.
+
+Abbiamo implementato spazi di indirizzamento virtuali isolati utilizzando il meccanismo di paginazione. Consideriamo ora dove posizionare l'applicazione nello spazio di indirizzamento disponibile (`[__free_ram; __free_ram_end]`).
+
+Creiamo un nuovo linker script `user.ld` che definisca dove posizionare l'applicazione in memoria.
+
+Sembra praticamente identico al linker script del kernel, ma la differenza fondamentale è l'indirizzo di base (`0x10000000`) che fa in modo che l'applicazione non si sovrapponga allo spazio di indirizzamento del kernel.
+
+### Userland Library
+
+Creiamo una libreria per i programmi userland. Per semplicità inizieremo ad implementare un set minimo di funzionalità per avviare l'applicazione.
+
+L'esecuzione dell'applicazione inizia dalla funzione `start`. Analogamente al processo di avvio del kernel, imposta il puntatore allo stack e richiama la funzione `main` dell'applicazione.
+
+Una volta che il `main` ha terminato l'esecuzione, viene chiamata la funzione `exit` che per ora consiste in un ciclo infinito.
+
+```c
+__attribute__((noreturn)) void exit(void){
+    for (;;);
+}
+```
+
+Definiamo inoltre `putchar` a cui fa riferimento la funzione `printf` in `common.c` che implementeremo.
+
+A differenza del processo di inizializzazione del kernel, non puliamo la sezione `.bss` con degli zeri. Questo perché il kernel garantisce di averla già riempita di zeri (nella funzione `alloc_pages`).
+
+### first application
+
+Essendo che non abbiamo ancora una libreria per lo spazio utente che ci implementa la funzione `printf`, possiamo realizzare un programma che esegue un ciclo infinito.
+
+```c
+#include "../user.h"
+
+void main(void) {
+    for (;;);
+}
+```
+
+Le applicazioni devono esser compilate separatamente dal kernel. Creiamo un nuovo script (`run.sh`) per la compilazione dell'applicazione.
+
+Cosa abbiamo aggiunto per la compilazione dell'applicazione:
+
+```sh
+OBJCOPY=/otp/homebrew/opt/llvm/bin/llvm-objcopy
+
+# costruiamo la applicazione shell
+$CC $CFLAGS -Wl,-Tuser.ld -Wl,-Map=shell.map -o shell.elf application/shell.c user.c common.c
+$OBJCOPY --set-section-flags .bss=alloc,contents -O binary shell.elf shell.bin
+$OBJCOPY -Ibinary -Oelf32-littleriscv shell.bin shell.bin.o
+
+# costruiamo il kernel (build)
+$CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
+	kernel.c common.c shell.bin.o
+```
+
+La prima chiamata `$CC` è molto simile allo script di compilazione del kernel. Compila i file C e collega al linker script (`user.ld`).
+
+Il primo comando `OBJCOPY` converte il file eseguibile (in formato elf) in formato binario grezzo (raw binary).
+
+Un binary raw è il contenuto effettivo che verrà espanso in memoria a partire dall'indirizzo base (`0x10000000`). Il sistema operativo può quindi preparare l'applicazione in memoria copiando semplicemente il contenuto del binary raw.
+
+I sistemi operativi più comuni utilizzano formati come ELF, in cui il contenuto della mmeoria e le relative informazioni di mappatura sono separati, in questo caso utilizzeremo il binary raw per semplicità.
+
+Il secondo comando `$OBJCOPY` converte l'immagine binaria di esecuzione in un formato che può esser incorporato nel linguaggio C.
+
+---
+
+In un sistema operativo vero, il kernel legge i file `.exe` dall'hard disk o dall'SSD. Ma qui non abbiamo ancora scritto i driver per il disco.
+
+Quindi il metodo consiste nell'inglobare il programma utente direttamente dentro il file del kernel, come se fosse una grossa immagine o una stringa costante.
+
+Le fasi sono:
+
+1) compilazione
+   
+   Si compila il codice C della shell usando il linker script utente che abbiamo appena realizzato. Questo produce un file ELF standard, che contiene il codice macchina, ma anche tante "intestazioni" che servono al debugger e al sistema operativo.
+
+2) conversione in **raw binary** (`shell.bin`)
+
+   ```c
+   $ llvm-objcopy -O binary shell.elf shell.bin
+   ```
+   cosa fa il comando:
+
+   1) prende il file ELF
+   2) butta via tutte le intestazioni, le tabelle dei simboli, le informazioni di debug
+   3) mantiene unicamente il codice macchina e i dati (le sezioni `.text`, `.data`, `.rodata`)
+   
+   Il risultato è `shell.bin`, ovvero una fotocopia esatta di come deve apparire la memoria RAM quando il programma è caricato.
+
+3) trasformazione in oggetto linkabile (`shell.bin.o`)
+   
+   ```bash
+   $ llvm-objcopy -I binary -O elf32-littleriscv shell.bin shell.bin.o
+   ```
+
+   Il kernel è compilato unendo tanti file oggetto (`kernel.o, trap.o, etc.`). Non possiamo unire file `.bin` grezzi al kernel. Il linker accetta solo file `.o`.
+
+   Quindi `objcopy` al contrario:
+
+   1) prende il file grezzo `shell.bin`
+   2) lo impacchetta dentro un file oggetto ELF (`shell.bin.o`)
+   3) viene marcato come architettura RISC-V (`elf32.littleriscv`)
+   
+   In pratica, stiamo travestendo il file binario da "pezzo di codice compilato", in modo che il linker del kernel accetti senza fare storie.
+
+4) simboli creati
+   
+   Quando `objcopy` crea questo file oggetto, genera automaticamente tre **simboli** (variabili globali) che il codice C del kernel può vedere.
+
+   I nomi generati sono:
+
+   - `_binary_shell_bin_start`: indirizzo dove inizia il file
+   - `_binary_shell_bin_end`: indirizzo della fine del file
+   - `_binary_shell_bin_size`: dimensione in byte.
+
+5) risultato
+   
+   Grazie a questo processo, nel `kernel.c` possiamo fare questo:
+
+   ```c
+   // Dichiariamo che queste variabili esistono "da qualche parte" (nel file oggetto linkato)
+    extern char _binary_shell_bin_start[];
+    extern char _binary_shell_bin_size[];
+
+    void main() {
+        // Possiamo copiare la shell dalla "pancia" del kernel alla memoria utente!
+        uint32_t shell_size = (uint32_t) _binary_shell_bin_size;
+        memcpy(destinazione_ram, _binary_shell_bin_start, shell_size);
+    }
+   ```
+
+   Ovvero caricare l'immagine del processo in memoria RAM.
+
+La variabile `_binary_shell_bin_size` contiene la dimensione del file. Tuttavia, viene utilizzata in modo leggermente insolito.
+
+```bash
+$ llvm-nm shell.bin.o | grep -i size
+00010250 A _binary_shell_bin_size
+
+ls -al shell.bin
+-rwxr-xr-x. 1 giobpc giobpc 66128 Feb 14 16:41 shell.bin
+
+$ python3 -c 'print(0x00010250)'
+66128
+```
+
+La prima colonna dell'output di `llvm-nm` è l'indirizzo del simbolo. Questo numero esadecimale corrisponde alla dimensione del file, ma non è una coincidenza.
+
+Generalmente, i valori di ciascun indirizzo in un dile `.o` sono determinati dal linker. Tuttavia, `_binary_shell_bin_size` è speciale.
+
+La `A` nella seconda colonna indica che l'indirizzo `_binary_shell_bin_size` è un tipo di simbolo assoluto che non deve essere modificato dal linker. In altre parole, incorpora la dimensione del file come indirizzo.
+
+Invece per gli altri simboli non è presente `A`, ma `D`:
+
+```bash
+$ llvm-nm shell.bin.o 
+00010250 D _binary_shell_bin_end
+00010250 A _binary_shell_bin_size
+00000000 D _binary_shell_bin_start
+```
+
+La lettera `D` significa che questi simboli puntano a dati reali in memoria.
+
+`A` sta per **Absolute** ovvero è fisso, non cambia mai. Il linker non può modificare l'indirizzo di quel simbolo.
+
+Quindi quello che `objcopy` fa è indicare che in quell'indirizzo è presente la dimensione del file, ma in realtà è l'indirizzo stesso la dimensione del file quando viene castato. All'idirizzo indircato non è presente nessun dato significativo riguardante il file.
+
+Quindi non viene effettivamente creata una variabile in memoria che contiene la dimensione effettiva del file.
+
+Infine, abbiamo aggiunto `shell.bin.o` agli argomenti `clang` nella compilazione del kernel. Quindi questo incoporerà l'eseguibile della prima applicazione nell'immagine del kernel.
+
+<!-- embed:file="run.sh" line="24-25" lock="true" -->
+```bash
+$CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
+	kernel.c common.c shell.bin.o
+```
+<!-- embed:end -->
+
+### disassemble the executable
+
+Disassemblando il file, possiamo vedere che la sezione `.text.start` è posizionata all'inizio del file eseguibile. La funzione `start` dovrebbe essere posizionata a `0x10000000` come segue:
+
+```bash
+$ llvm-objdump -d ./shell.elf
+
+./shell.elf:    file format elf32-littleriscv
+
+Disassembly of section .text:
+
+10000000 <start>:
+10000000: 10010537      lui     a0, 0x10010
+10000004: 25050513      addi    a0, a0, 0x250
+10000008: 812a          mv      sp, a0
+1000000a: 2011          jal     0x1000000e <main>
+1000000c: 2011          jal     0x10000010 <exit>
+
+...
+
+1000000e <main>:
+1000000e: a001          j       0x1000000e <main>
+
+...
+
+10000010 <exit>:
+10000010: a001          j       0x10000010 <exit>
+
+...
+```
+
+## user mode
+
+Dobbiamo eseguire quindi l'applicazione realizzata `shell.c`.
+
+Affinché possiamo eseguirla dobbiamo capire dove viene memorizzata. Infatti c'è una differenza tra quello che abbiamo fatto con una raw binary e quello che fanno i OS complessi direttamente con il file ELF.
+
+1) Un file ELF non contiene solo il codice del programma.
+   
+   Esso infatti contiene:
+
+   - contenuto: codice macchina (`.text`), dati (`.data`) ...
+   - **intestazione**: in cui sono presenti diverse informazioni fondamentali per la gestione dell'immagine dell'applicazione.
+2) Invece il file `shell.bin` che abbiamo è un raw binary.
+   
+   Ovvero non contiene un'intestazione con tutte queste informazioni necessarie, ma unicamente il contenuto.
+
+   Non è presente alcun metadato.
+
+La soluzione è quindi quella di stabilire un patto, ovvero un valore fisso in cui l'immagine dell'applicazione verrà posizionata in memoria. Poiché non abbiamo a disposizione un'intestazione che istruisce il kernel sulla posizione.
+
+Il patto fisso è tra il compilatore e il kernel:
+
+- il campilatore (Linker Script)
+  
+  Nel file `user.ld` abbiamo inserito come indirizzo iniziale `. = 0x10000000`.
+
+  Quindi stiamo dicendo al compilatore di realizzare un file oggetto considerando che l'immagine viene caricata a partire dall'indirizzo `0x10000000`.
+
+- il kernel
+  
+  Essendo che abbiamo caricato l'immagine come un raw binary, il kernel non sa effettivamente questa dove è dislocata, deve saperlo già.
+
+  Motivo per cui dobbiamo utilizzare la macro `USER_BASE`. In questo modo possiamo far in modo che il programma utilizzi indirizzi virtuali che verranno poi mappati in indirizzi fisici del tutto diversi.
+
+<!-- embed:file="kernel.h" line="7-9" lock="true" -->
+```c
+// l'indirizzo virtuale dell'immagine dell'applicazione.
+// Tale indirizzo deve coincidere con quello definito in `user.ld`.
+#define USER_BASE 0x10000000
+```
+<!-- embed:end -->
+
+Successivamente definiamo i simboli per utilizzare il raw binary incorporato in `shell.bin.o`.
+
+<!-- embed:file="kernel.h" line="12-12" lock="true" -->
+```c
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
+```
+<!-- embed:end -->
+
+Inoltre dobbiamo aggiornare la funzione `create_process` per avviare l'applicazione.
+
+Abbiamo aggiunto:
 
 
+<!-- embed:file="kernel.c" line="206-206" lock="true" -->
+[Source: kernel.c](kernel.c#L206-L206)
+```c
+struct process *create_process(const void *image, size_t image_size){
+```
+<!-- embed:end -->
 
+<!-- embed:file="kernel.c" line="235-235" lock="true" -->
+[Source: kernel.c](kernel.c#L235-L235)
+```c
+	*--sp = (uint32_t) user_entry;
+```
+<!-- embed:end -->
+
+<!-- embed:file="kernel.c" line="245-261" lock="true"-->
+[Source: kernel.c](kernel.c#L245-L261)
+```c
+	// Map delle pagine user
+
+	for (uint32_t off = 0; off < image_size; off += PAGE_SIZE){
+		paddr_t page = alloc_pages(1);
+
+		// gestione del caso in cui i dati da copiare siano una quantità minore di una pagina
+
+		size_t remaining = image_size - off;
+		size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+		// riempiamo la pagina appena allocata con i dati
+
+		memcpy((void *)page, image + off, copy_size);
+
+		// mappiamo la pagina appena realizzata
+		map_page(page_table, USER_BASE + off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+	}
+```
+<!-- embed:end -->
+
+Abbiamo modificato `create_process` in modo che accetti come argomenti il puntatore all'immagine dell'applicazione (`image`) e la dimensione dell'immagine (`image_size`).
+
+Copia l'immagine pagina per pagina per la dimensione specificata e la mappa alla tabella delle pagine del processo. Inoltre, imposta la destinazione del salto del primo cambio di contesto su `user_entry`.

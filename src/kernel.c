@@ -6,16 +6,20 @@ extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[],
 sbiret sbi_call(long arg0,long arg1,long arg2,long arg3,long arg4,long arg5, long fid, long eid);
 
 
+// User mode
+void user_entry(void);
+
+
 // process
 
 struct process procs[PROCS_MAX]; // All process control structures.
 
 // prepara un nuovo processo per eseguire
-struct process *create_process(uint32_t pc);
+struct process *create_process(const void *image, size_t image_size);
 
 
 // scheduler
-	
+
 struct process *current_proc;	// processo che sta eseguendo
 struct process *idle_proc;	// idle process
 
@@ -62,6 +66,7 @@ struct process *proc_b;
 void proc_a_entry(void){
 	printf("starting process A\n");
 	while (1){
+		// printf("%x\n", SATP_SV32);
 		putchar('A');
 		yield();
 	}
@@ -105,13 +110,13 @@ void kernel_main(void) {
 	
 	// PANIC("unreachable here!");
 	
-	idle_proc = create_process((uint32_t) NULL);
+	idle_proc = create_process(NULL, 0);
 	idle_proc->pid = 0;
 	current_proc = idle_proc;
 	
-	proc_a = create_process((uint32_t) proc_a_entry);
-	proc_b = create_process((uint32_t) proc_b_entry);
-	
+
+	create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
+
 	yield();
 	PANIC("switched to idle process");
 	
@@ -175,15 +180,15 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags){
 	if (!is_aligned(paddr, PAGE_SIZE)){
 		PANIC("unaligned vaddr %x", paddr);
 	}
-
+	
 	uint32_t vpn1  = (vaddr >> 22) & 0x3ff;
-
+	
 	if ((table1[vpn1] & PAGE_V) == 0){
 		// crea la entry della prima page table se questa non esiste.
 		uint32_t pt_paddr = alloc_pages(1);
 		table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
 	}
-
+	
 	// crea la page table di secondo entry per mappare la pagina fisica
 	uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
 	uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
@@ -191,12 +196,14 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags){
 }
 
 
-
-
+// User mode
+void user_entry(void){
+	PANIC("not yet implemented");
+}
 
 
 // prepara un nuovo processo per eseguire
-struct process *create_process(uint32_t pc){
+struct process *create_process(const void *image, size_t image_size){
 	// find an unused process control structure
 	
 	struct process *proc = NULL;
@@ -209,7 +216,7 @@ struct process *create_process(uint32_t pc){
 	}
 	
 	if (!proc)
-	PANIC("no free process slots");
+		PANIC("no free process slots");
 	
 	// creiamo un contesto fittizio
 	uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
@@ -225,7 +232,7 @@ struct process *create_process(uint32_t pc){
 	*--sp = 0; // s2
 	*--sp = 0; // s1
 	*--sp = 0; // s0
-	*--sp = (uint32_t) pc;
+	*--sp = (uint32_t) user_entry;
 
 
 	// allochiamo le pagine del kernel
@@ -235,6 +242,26 @@ struct process *create_process(uint32_t pc){
 		 paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 	 
+	// Map delle pagine user
+
+	for (uint32_t off = 0; off < image_size; off += PAGE_SIZE){
+		paddr_t page = alloc_pages(1);
+
+		// gestione del caso in cui i dati da copiare siano una quantità minore di una pagina
+
+		size_t remaining = image_size - off;
+		size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+		// riempiamo la pagina appena allocata con i dati
+
+		memcpy((void *)page, image + off, copy_size);
+
+		// mappiamo la pagina appena realizzata
+		map_page(page_table, USER_BASE + off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+	}
+
+
+
 	 // inizializziamo i campi del nuovo processo
 	proc->pid = i + 1;
 	proc->state = PROC_RUNNABLE;
