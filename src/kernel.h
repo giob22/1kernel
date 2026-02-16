@@ -1,6 +1,10 @@
 #pragma once
 #include "common.h"
 
+//* syscall
+
+#define SCAUSE_ECALL 8
+
 
 //* User Mode
 
@@ -19,6 +23,8 @@ extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
 
 #define PROC_UNUSED 0   // PCB non utilizzata
 #define PROC_RUNNABLE 1 // PCB utilizzata ed eseguibile
+
+#define PROC_EXITED 2
 
 struct process {
     int pid;

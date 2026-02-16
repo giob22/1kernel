@@ -1602,6 +1602,23 @@ Disassembly of section .text:
 10000012: 8082          ret
 ```
 
+Cosa fanno i comandi che abbiamo utilizzato:
+
+- `(qemu) xp /32b 0x80265000`:
+  
+  `xp` esamina la memoria fisica, `/32b` mostra 32 byte senza cercare di interpretarli come istruzioni, mostra solo numeri.
+- `$ hexdump -C ./shell.bin | head`:
+  
+  Mostra il contenuto del file byte per byte, in esadecimale.
+
+  `-C` sta per **Canonical**, mostra i dati nel formato standard più leggibile per gli umani.
+- `(qemu) xp /8i 0x80265000`:
+  
+  `/8i` mostra 8 istruzioni.
+- `$ llvm-objdump -d ./shell.elf | head -n20`:
+  
+  Disassemble il file. Prende il codice macchina e lo ritraduce in linguaggio assembly leggibile dall'uomo
+
 ### transition to user mode
 
 Per eseguire applicazioni, utilizziamo una modalità della CPU chiamata *user mode*, o in termini di RISC-V, *U-mode*. Passare alla modalità *U* è molto facile:
@@ -1663,4 +1680,314 @@ La quindicesima eccezione (`scause = 0xf = 15`) corrisponde a un "Store/AMO page
 
 ## system call
 
+Le system call consistono nell'interfaccia tra i processi utente e il kernel. Attraverso queste le applicazioni utente possono richiedere al kernel dei servizi o funzionalità.
 
+L'invocazione della chiamata di sistema è molto simile all'implementazione della chaimata SBI che abbiamo visto in precedenza.
+
+<!-- embed:file="user.c" region="syscall" -->
+[Source: user.c](user.c#L9-L23)
+```c
+int syscall(int sysno, int arg0, int arg1, int arg2){
+    register int a0 __asm__("a0") = arg0;
+    register int a1 __asm__("a1") = arg1;
+    register int a2 __asm__("a2") = arg2;
+    register int a3 __asm__("a3") = sysno;
+    
+    __asm__ __volatile__(
+        "ecall"
+        : "=r"(a0)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3)
+        : "memory"
+    );
+    
+    return a0;
+}
+```
+<!-- embed:end -->
+
+La funzione `syscall` imposta il numero della chiamata di sistema nel registro `a3` e gli argomenti della chiamata di sistam nei registri da `a0`  a `a2`, quindi esegue l'istruzione `ecall`.
+
+L'istruzione `ecall` è un'istruzione speciale utilizzata per delegare l'elaborazione al kernel. Quando l'istruzione `ecall` viene eseguita, viene chiamato un gestore delle eccezioni e il controllo viene trasferito al kernel. Il valore di ritorno dal kernel viene impostato nel registor `a0`.
+
+La prima chiamata di sistema che implementeremo sarà `putchar`, che restituisce un carattere tramite chiamata di sistema. Accetta un carattere come primo argomento.
+
+<!-- embed:file="common.h" line="33-33" lock="true" -->
+[Source: common.h](common.h#L33-L33)
+```c
+#define SYS_PUTCHAR 1
+```
+<!-- embed:end -->
+<!-- embed:file="user.c" line="32-34" lock="true"-->
+[Source: user.c](user.c#L32-L34)
+```c
+void putchar(char ch){
+    syscall(SYS_PUTCHAR, ch, 0, 0);
+}
+```
+<!-- embed:end -->
+
+### handle `ecall` instruction in the kernel
+
+Dobbiamo aggiornare il gestore delle eccezioni per gestire l'istruzione `ecall`
+
+<!-- embed:file="kernel.h" line="6-6" lock="true" -->
+[Source: kernel.h](kernel.h#L6-L6)
+```c
+#define SCAUSE_ECALL 8
+```
+<!-- embed:end -->>
+
+<!-- embed:file="kernel.c" line="475-489" lock="true"-->
+[Source: kernel.c](kernel.c#L475-L489)
+```c
+// legge il motivo per cui si è verificata l'eccezione e lo mostra a video
+void handle_trap(struct trap_frame *f) {
+	uint32_t scause = READ_CSR(scause);
+    uint32_t stval = READ_CSR(stval);
+    uint32_t user_pc = READ_CSR(sepc);
+
+	if (scause == SCAUSE_ECALL){
+		handle_syscall(f);
+		user_pc +=4;
+	}else{
+		PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+	}
+
+	WRITE_CSR(sepc, user_pc);	
+}
+```
+<!-- embed:end -->
+
+1) diagnosi: `scause`
+   
+   Quando il processore entra nel gestore dei trap, la prima cosa da fare è capire perché siamo qui.
+
+   Se per errore grave oppure per una richiesta di esecuzione di un servizio del kernel.
+
+   Quando la CPU esegue `ecall` imposta automaticamente il registro `scause` al valore 8.
+2) ritorno
+   
+   Quando avviene un'eccezione, la CPU salva l'indirizzo dell'istruzione che ha causato l'evento nel registro `sepc` (supervisor exception program counter).
+
+   Il workflow che si genera sarà:
+
+   - `ecall` a `x` (indirizzo)
+   - la CPU salva `x` dentro `sepc`
+   - salta al kernel
+   - il kernel fa il suo lavoro
+   - il kernel deve tornare all'utente con l'istruzione `sret`
+
+   Se non facessimo `+ 4`:
+
+   - L'istruzione `sret` riporterà la CPU all'indirizzo contenuto in `sepc`, ovvero `x`. Quindi eseguirebbe nuovamente `ecall`.
+
+    Il kernel verrà richiamato e si genererebbe un ciclo infinito.
+  
+  Facendo `user_pc += 4`:
+
+  - Poiché l'istruzione RISC-V standard sono lunghe 4 byte, aggiungendo 4 a `sepc` spostiamo il puntatore di ritorno all'istruzione successiva.
+
+    Il kernel quando esegue `sret`, il programma riprenderà da dove doveva continuare.
+
+### system call handler
+
+Implementiamo il gestore delle chiamate di sistema che verrà richiamato dal gestore delle trap.
+
+<!-- embed:file="kernel.c" line="497-506" lock="true" -->
+[Source: kernel.c](kernel.c#L497-L506)
+```c
+// syscall handler
+void handle_syscall(struct trap_frame *f){
+	switch (f->a3){
+		case SYS_PUTCHAR:
+			putchar(f->a0);
+			break;
+		default:
+			PANIC("unexpected syscall a3=%x\n", f->a3);
+	}
+}
+```
+<!-- embed:end -->
+
+Determina il tipo di chiamata di sistema controllando il valore del registro `a3`. Ora abbiamo una sola chiamata di sistema, `SYS_PUTCHAR`, che restituisce semplicemente il carattere memorizzato nel registro `a0`.
+
+### test the system call
+
+Proviamo ad utilizzare la funzione `printf` in `common.c`.
+
+### receive characters from keyboard (`getchar` system call)
+
+L'obiettivo è realizzare una shell, quindi dobbiamo prevedere il modo per ottenere caratteri da tastiera.
+
+SBI fornisce un'interfaccia per leggere "input to the debug console". Se non c'è input, restituisce `-1`.
+
+A livello kernel quindi avremo:
+<!-- embed:file="kernel.c" line="182-185" lock="true" -->
+[Source: kernel.c](kernel.c#L182-L185)
+```c
+long getchar(void){
+  sbiret ret = sbi_call(0,0,0,0,0,0,0,2);
+	return ret.error;
+}
+```
+<!-- embed:end -->
+
+<!-- embed:file="kernel.c" line="509-527"-->
+[Source: kernel.c](kernel.c#L509-L527)
+```c
+void handle_syscall(struct trap_frame *f){
+	switch (f->a3){
+		case SYS_PUTCHAR:
+			putchar(f->a0);
+			break;
+		case SYS_GETCHAR:
+			while (1) {
+				// polling
+				long ch = getchar();
+				if (ch >= 0){
+					f->a0 = ch;
+					break;
+				}
+				yield();
+			}
+			break;
+		case SYS_EXIT:
+			printf("process %d exited\n", current_proc->pid);
+			current_proc->state = PROC_EXITED;
+```
+<!-- embed:end -->
+
+L'implementazione della chiamata si sistema `getchar` richiama ripetutamente l'SBI finché non viene inserito un carattere. Tuttavia, la semplice ripetizione impedisce l'esecuzione di altri processi, quindi chiamiamo la funzione `yield` per cedere la CPU ad altri processi.
+
+A livello user invece:
+
+<!-- embed:file="common.h" line="34-34" lock="true" -->
+[Source: common.h](common.h#L34-L34)
+```c
+#define SYS_GETCHAR 2
+```
+<!-- embed:end -->
+<!-- embed:file="user.c" line="33-35" -->
+[Source: user.c](user.c#L33-L35)
+```c
+}
+
+int getchar(void){
+```
+<!-- embed:end -->
+
+### write a shell
+
+<!-- embed:file="./application/shell.c" lock="true"-->
+[Source: ./application/shell.c](application/shell.c)
+```c
+#include "../user.h"
+
+void main(void) {
+    // *((volatile int*) 0x80200000) = 0x1234; // istruzione privilegiata, stiamo modificando pagine del kernel
+
+    // printf("Hello World from shell\n");
+    // for (;;);
+    while (1){
+prompt:
+
+        printf("> ");
+        char cmdline[128];
+        for(int i = 0;; i++){
+            char ch = getchar();
+            putchar(ch);
+            if (i == sizeof(cmdline) - 1){
+                printf("\ncommand line too long\n");
+                goto prompt;
+            }else if (ch == '\r'){
+                printf("\n");
+                cmdline[i] == '\0';
+                break;
+            }else{
+                cmdline[i] = ch;
+            }
+        }
+
+        if (strcmp(cmdline, "hello") == 0){
+            printf("Hello world from shell!!\n");
+        }else{
+            printf("unknown command: %s\n", cmdline);
+        }
+    }
+    
+}
+```
+<!-- embed:end -->
+
+Legge i caratteri finché non arriva una nuova riga e controlla se la stringa immessa corrisponde al nome del comando.
+
+### process termination (`exit` system call)
+
+Infine implementiamo la chiamata di sistema `exit`, che termina il processo:
+
+<!-- embed:file="common.h" line="35-35" lock="true" -->
+[Source: common.h](common.h#L35-L35)
+```c
+#define SYS_EXIT 3
+```
+<!-- embed:end -->
+
+<!-- embed:file="kernel.h" line="27-27" lock="true" -->
+[Source: kernel.h](kernel.h#L27-L27)
+```c
+#define PROC_EXITED 2
+```
+<!-- embed:end -->
+
+<!-- embed:file="user.c" line="5-8" lock="true" -->
+[Source: user.c](user.c#L5-L8)
+```c
+__attribute__((noreturn)) void exit(void){
+    syscall(SYS_EXIT, 0, 0, 0);
+    for (;;); // unreachable
+}
+```
+<!-- embed:end -->
+
+Infine modifichiamo la `handle_syscall`:
+
+<!-- embed:file="kernel.c" line="509-533" lock="true"-->
+[Source: kernel.c](kernel.c#L509-L533)
+```c
+void handle_syscall(struct trap_frame *f){
+	switch (f->a3){
+		case SYS_PUTCHAR:
+			putchar(f->a0);
+			break;
+		case SYS_GETCHAR:
+			while (1) {
+				// polling
+				long ch = getchar();
+				if (ch >= 0){
+					f->a0 = ch;
+					break;
+				}
+				yield();
+			}
+			break;
+		case SYS_EXIT:
+			printf("process %d exited\n", current_proc->pid);
+			current_proc->state = PROC_EXITED;
+			yield();
+			PANIC("unreachable");
+		default:
+			PANIC("unexpected syscall a3=%x\n", f->a3);
+	}
+}
+```
+<!-- embed:end -->
+
+La chiamata di sistema modifica lo stato del processo in `PROC_EXITED` e richiama `yield` per cedere la CPU ad altri processi. Lo scheduler eseguirà solo i processi nello stato `PROC_RUNNABLE`, quindi non tornerà mai a questo processo. Tuttavia, è stata aggiunta la macro `PANIC` per generare un panico nel caso in cui il processo ritorni ad eseguire.
+
+> Per ora abbiamo unicamente marcato il processo terminato con uno stato particolare, in realtà, se si vuole implementare un sistema operativo pratico bisogna liberare la risorsa che occupa.
+>
+> Ovvero la risorsa struct process che è occupata da un processo terminato.
+
+--- 
+
+Aggiungiamo il comando `exit` alla shell
