@@ -8,6 +8,7 @@
 // Tale indirizzo deve coincidere con quello definito in `user.ld`.
 
 #define USER_BASE 0x10000000
+#define SSTATUS_SPIE (1 << 5)
 
 extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
 

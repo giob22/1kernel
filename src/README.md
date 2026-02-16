@@ -1511,3 +1511,156 @@ struct process *create_process(const void *image, size_t image_size){
 Abbiamo modificato `create_process` in modo che accetti come argomenti il puntatore all'immagine dell'applicazione (`image`) e la dimensione dell'immagine (`image_size`).
 
 Copia l'immagine pagina per pagina per la dimensione specificata e la mappa alla tabella delle pagine del processo. Inoltre, imposta la destinazione del salto del primo cambio di contesto su `user_entry`.
+
+
+> **warning**
+>
+> Se si mappa direttamente l'immagine di esecuzione senza copiarla, i processi della stessa applicazione finirebbero per le stesse pagine fisiche. Questo non permetterebbe l'isolamento della memoria.
+
+<!-- embed:file="kernel.c" line="118-118" lock="true"-->
+[Source: kernel.c](kernel.c#L118-L118)
+```c
+	create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
+```
+<!-- embed:end -->
+
+Controlliamo tramite il monitor QEMU che l'immagine sia mappata come previsto:
+
+```bash
+(qemu) info mem
+vaddr    paddr            size     attr
+-------- ---------------- -------- -------
+10000000 0000000080265000 00001000 rwxu---
+10001000 0000000080267000 00010000 rwxu---
+80200000 0000000080200000 00001000 rwx--a-
+80201000 0000000080201000 0000f000 rwx----
+```
+
+Possiamo vedere che l'indirizzo fisico `0x80265000` è mappato all'indirizzo virtuale `0x10000000` (`USER_BASE`). 
+
+Vediamo cosa è contenuto all'interno di questo indirizzo fisico attraverso il comando `xp`.
+
+```bash
+(qemu) xp /32b 0x80265000
+0000000080265000: 0x37 0x05 0x01 0x10 0x13 0x05 0x05 0x25
+0000000080265008: 0x2a 0x81 0x11 0x20 0x11 0x20 0x01 0xa0
+0000000080265010: 0x01 0xa0 0x82 0x80 0x1d 0x71 0x06 0xde
+0000000080265018: 0x22 0xdc 0x26 0xda 0x4a 0xd8 0x4e 0xd6
+```
+
+```bash
+$ hexdump -C ./shell.bin | head
+00000000  37 05 01 10 13 05 05 25  2a 81 11 20 11 20 01 a0  |7......%*.. . ..|
+00000010  01 a0 82 80 1d 71 06 de  22 dc 26 da 4a d8 4e d6  |.....q..".&.J.N.|
+00000020  52 d4 56 d2 5a d0 5e ce  62 cc 66 ca 6a c8 6e c6  |R.V.Z.^.b.f.j.n.|
+00000030  2a 84 be ca c2 cc c6 ce  ae c2 b2 c4 b6 c6 ba c8  |*...............|
+00000040  c8 00 13 0a 50 02 13 09  20 07 29 4c a5 4a b7 d5  |....P... .)L.J..|
+00000050  cc cc 13 0b 30 07 93 0b  80 07 2a c4 13 8d d5 cc  |....0.....*.....|
+00000060  b7 0c 00 10 93 8c 8c 23  21 a0 63 07 05 12 05 04  |.......#!.c.....|
+00000070  03 45 04 00 63 07 45 01  63 03 05 12 59 3f 05 04  |.E..c.E.c...Y?..|
+00000080  c5 bf 03 45 14 00 05 04  63 44 a9 02 e3 08 45 ff  |...E....cD....E.|
+00000090  93 05 40 06 e3 1b b5 fc  22 45 93 05 45 00 2e c4  |..@....."E..E...|
+```
+
+Non è comprensibile in esadecimale, quindi disassembliamo il codice macchina per vedere se corrisponde alle istruzioni previste.
+
+```bash
+(qemu) xp /8i 0x80265000
+0x80265000:  10010537          lui                     a0,65552
+0x80265004:  25050513          addi                    a0,a0,592
+0x80265008:  812a              mv                      sp,a0
+0x8026500a:  2011              jal                     ra,4                    # 0x8026500e
+0x8026500c:  2011              jal                     ra,4                    # 0x80265010
+0x8026500e:  a001              j                       0                       # 0x8026500e
+0x80265010:  a001              j                       0                       # 0x80265010
+0x80265012:  8082              ret                     
+```
+
+Confrontiamo questo risultato con il disassemblaggio del file `shell.elf`. Così da verificare cosa se quello che accade corrisponde all'esecuzione dell'applicazione.
+
+```bash
+$ llvm-objdump -d ./shell.elf | head -n20
+
+./shell.elf:    file format elf32-littleriscv
+
+Disassembly of section .text:
+
+10000000 <start>:
+10000000: 10010537      lui     a0, 0x10010
+10000004: 25050513      addi    a0, a0, 0x250
+10000008: 812a          mv      sp, a0
+1000000a: 2011          jal     0x1000000e <main>
+1000000c: 2011          jal     0x10000010 <exit>
+
+1000000e <main>:
+1000000e: a001          j       0x1000000e <main>
+
+10000010 <exit>:
+10000010: a001          j       0x10000010 <exit>
+
+10000012 <putchar>:
+10000012: 8082          ret
+```
+
+### transition to user mode
+
+Per eseguire applicazioni, utilizziamo una modalità della CPU chiamata *user mode*, o in termini di RISC-V, *U-mode*. Passare alla modalità *U* è molto facile:
+
+<!-- embed:file="kernel.h" line="11-11" lock="true"-->
+[Source: kernel.h](kernel.h#L11-L11)
+```c
+#define SSTATUS_SPIE (1 << 5)
+```
+<!-- embed:end -->
+
+<!-- embed:file="kernel.c" line="199-211" lock="true"-->
+[Source: kernel.c](kernel.c#L199-L211)
+```c
+// User mode
+__attribute__((naked)) // IMPORTANT
+void user_entry(void){
+	__asm__ __volatile__(
+		"csrw sepc, %[sepc]\n"
+		"csrw sstatus, %[sstatus]\n"
+		"sret \n"
+		:
+		: [sepc] "r" (USER_BASE),
+			[sstatus] "r" (SSTATUS_SPIE)
+	);
+	
+}
+```
+<!-- embed:end -->
+
+Per passare alla User Mode sfruttiamo la istruzione `sret`. Tuttavia per arrivare effettivamente ad eseguire il codice dell'applicazione in user mode dobbiamo modificare il contenuto dei registri CSR.
+
+- Impostiamo il program counter per far partire l'esecuzione della applicazione nel `sepc`. Tale registro contiene l'indirizzo a cui salterà l'istruzione `sret`.
+- Impostiamo il bit `SPIE` nel registro `sstatus`. Impostato questo bit, si abilitano gli interrupt hardware quando si entra in U-mode e verrà chiamato il gestore impostato nel registro `stvec`
+
+> non utilizziamo, per semplicità, le interrupt hardware ma il polling. Quindi non è necessario impostare il bit SPIE effettivamente.
+
+Verifichiamo se effettivamente ci troviamo in user mode (il bit 8 dello `sstatus` deve essere pari a 0). Inseriamo una istruzione che porti l'applicazione a scrivere in un'area di memoria dedicata la kernel.
+
+<!-- embed:file="application/shell.c" lock="true" -->
+[Source: application/shell.c](application/shell.c)
+```c
+#include "../user.h"
+
+void main(void) {
+    *((volatile int*) 0x80200000) = 0x1234; // istruzione privilegiata, stiamo modificando pagine del kernel
+    for (;;);
+}
+```
+<!-- embed:end -->
+
+Quando eseguiamo otteniamo:
+
+```bash
+PANIC: kernel.c:481: unexpected trap scause=0000000f, stval=80200000, sepc=10000018
+```
+
+La quindicesima eccezione (`scause = 0xf = 15`) corrisponde a un "Store/AMO page fault".
+
+## system call
+
+

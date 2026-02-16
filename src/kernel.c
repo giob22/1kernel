@@ -197,8 +197,17 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags){
 
 
 // User mode
+__attribute__((naked)) // IMPORTANT
 void user_entry(void){
-	PANIC("not yet implemented");
+	__asm__ __volatile__(
+		"csrw sepc, %[sepc]\n"
+		"csrw sstatus, %[sstatus]\n"
+		"sret \n"
+		:
+		: [sepc] "r" (USER_BASE),
+			[sstatus] "r" (SSTATUS_SPIE)
+	);
+	
 }
 
 
