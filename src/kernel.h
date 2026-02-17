@@ -71,7 +71,7 @@ struct virtio_virtq{
 struct virtio_blk_req {
     // primo descrittore: read-only from the device 
     uint32_t type;
-    uint32_t reserved;
+    uint32_t reserved; // PADDING (spazio vuoto richiesto dallo standard)
     uint64_t sector;
     
     // secondo descrittore writable by the device if it's a read operation (VIRTQ_DESC_F_WRITE)

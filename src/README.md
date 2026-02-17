@@ -2295,6 +2295,23 @@ Abbiamo un dispositivo `virtio-blk` inizializzato. Inviamo una richiesta di I/O 
 
 Le richieste di I/O al disco vengono implementate aggiungendo una richiesta di elaborazione alla coda virtuale. Lo facciamo implementando la funzione `virtq_kick` che notifica al device che è presente una nuova richiesta.
 
+<!-- embed:file="kernel.c" line="295-301" lock="true" withLineNumbers="true" -->
+[Source: kernel.c](kernel.c#L295-L301)
+```c
+295: void virtq_kick(struct virtio_virtq *vq, int desc_index){
+296: 	vq->avail.ring[vq->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
+297: 	vq->avail.index++;
+298: 	__sync_synchronize();
+299: 	virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+300: 	vq->last_used_index++;
+301: }
+```
+<!-- embed:end -->
+
+- `__sync_synchronize()` è importantissimo, evita che il processore possa riordinare le istruzioni per andare più veloce.
+  
+  Ovvero garantisce che tutte le istruzioni precedenti siano state eseguite completamente prima di eseguire le successive.
+
 In particolar modo riferisce l'indice del primo descrittore della nuova richiesta.
 
 <!-- embed:file="kernel.c" line="299-345" withLineNumbers="true" lock="true" -->
@@ -2363,14 +2380,14 @@ Una richiesta viene inviata nei seguenti passaggi:
 
 Nella funzione stiamo creado una catena di descrittori composta da 3 descrittori. Abbiamo quindi bisogno di 3 descrittori perché ognuno ha attributi (`flags`) diversi:
 
-<!-- embed:file="kernel.h" line="70-82" lock="true" -->
+<!-- embed:file="kernel.h" line="70-82" lock="false" -->
 [Source: kernel.h](kernel.h#L70-L82)
 ```c
 // Virtio-blk request
 struct virtio_blk_req {
     // primo descrittore: read-only from the device 
     uint32_t type;
-    uint32_t reserved;
+    uint32_t reserved; // PADDING (spazio vuoto richiesto dallo standard)
     uint64_t sector;
     
     // secondo descrittore writable by the device if it's a read operation (VIRTQ_DESC_F_WRITE)
