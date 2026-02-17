@@ -6,6 +6,23 @@ extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[],
 sbiret sbi_call(long arg0,long arg1,long arg2,long arg3,long arg4,long arg5, long fid, long eid);
 
 
+// disk I/O
+
+uint32_t virtio_reg_read32(unsigned offset);
+uint64_t virtio_reg_read64(unsigned offset);
+void virtio_reg_write32(unsigned offset, uint32_t value);
+void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value);
+
+struct virtio_virtq *blk_request_vq;
+struct virtio_blk_req *blk_req;
+paddr_t blk_req_paddr;
+uint64_t blk_capacity;
+
+void virtio_blk_init(void);
+
+struct virtio_virtq *virtq_init(unsigned index);
+
+
 
 // syscall handler
 void handle_syscall(struct trap_frame *f);
@@ -64,52 +81,58 @@ void putchar(char ch);
 
 // void delay(void){
 	// 	for (int i = 0; i < 30000000; i++){
-		// 		__asm__ __volatile__("nop"); // non fare nulla
+// 		__asm__ __volatile__("nop"); // non fare nulla
+// 	}
+// }
+
+// struct process *proc_a;
+// struct process *proc_b;
+
+
+// void proc_a_entry(void){
+	// 	printf("starting process A\n");
+	// 	while (1){
+		// 		// printf("%x\n", SATP_SV32);
+		// 		putchar('A');
+		// 		yield();
 		// 	}
+		
 		// }
-		
-		// struct process *proc_a;
-		// struct process *proc_b;
-		
-		
-		// void proc_a_entry(void){
-			// 	printf("starting process A\n");
+		// void proc_b_entry(void){
+			// 	printf("starting process B\n");
 			// 	while (1){
-				// 		// printf("%x\n", SATP_SV32);
-				// 		putchar('A');
+				// 		putchar('B');
 				// 		yield();
 				// 	}
 				
 				// }
-				// void proc_b_entry(void){
-					// 	printf("starting process B\n");
-					// 	while (1){
-						// 		putchar('B');
-						// 		yield();
-						// 	}
-						
-						// }
-						
-						// * main
-						void kernel_main(void) {
-							memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
-							memset(procs, 0, sizeof(procs)); // Explicitly clear procs to ensure clean state
-							
-							printf("\n\n");
-							
-							// lezione allocator
-							// paddr_t paddr0 = alloc_pages(2);
-							// paddr_t paddr1 = alloc_pages(1);
-							
-							// printf("alloc_pages test: paddr0=%x\n", paddr0);
-							// printf("alloc_pages test: paddr1=%x\n", paddr1);
-							
-							
-							WRITE_CSR(stvec, (uint32_t)kernel_entry);
-							// __asm__ __volatile__ ("unimp"); // pseudo istruzione che attiva un'eccezione illegale
-							// PANIC("booted!");
-							// printf("unreachable here!\n");
-							// idle loop
+				
+// * main
+void kernel_main(void) {
+	memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+	memset(procs, 0, sizeof(procs)); // Explicitly clear procs to ensure clean state
+	WRITE_CSR(stvec, (uint32_t)kernel_entry);
+	
+	virtio_blk_init();
+					
+					
+	printf("\n\n");
+	
+	// lezione allocator
+	// paddr_t paddr0 = alloc_pages(2);
+	// paddr_t paddr1 = alloc_pages(1);
+	
+	// printf("alloc_pages test: paddr0=%x\n", paddr0);
+	// printf("alloc_pages test: paddr1=%x\n", paddr1);
+	
+	
+	
+	
+	
+	// __asm__ __volatile__ ("unimp"); // pseudo istruzione che attiva un'eccezione illegale
+	// PANIC("booted!");
+	// printf("unreachable here!\n");
+	// idle loop
     // per evitare che il kernel vadi in una busy wait, eseguiamo la istruzione `wfi` (wait for interrupt)
 	
 	// proc_a = create_process((uint32_t) proc_a_entry);
@@ -183,6 +206,76 @@ long getchar(void){
 	sbiret ret = sbi_call(0,0,0,0,0,0,0,2);
 	return ret.error;
 }
+
+
+
+// disk I/O
+uint32_t virtio_reg_read32(unsigned offset){
+	return *((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset));
+}
+
+uint64_t virtio_reg_read64(unsigned offset){
+	return *((volatile uint64_t *)(VIRTIO_BLK_PADDR + offset));
+}
+
+void virtio_reg_write32(unsigned offset, uint32_t value){
+	*((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset)) = value;
+}
+
+void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value){
+	virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+}
+
+
+void virtio_blk_init(void){
+	if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
+		PANIC("virtio: invalid magic value");
+	if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
+		PANIC("virtio: invalid version");
+	if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
+		PANIC("virtio: invalid device id");
+	
+	// 1 reset the device
+	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+	// 2 set the ACKNOWLEDGE status bit: Abbiamo trovato il device
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+	// 3 set the DRIVER status bit: Conosciamo come utilizzare il device
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
+	// 4 set our page size: utilizziamo pagine di 4KB. Questo definisce il PFN (page frame number) calculation
+	virtio_reg_write32(VIRTIO_REG_PAGE_SIZE, PAGE_SIZE);
+	// 5 inizializiamo una coda per le richieste di lettura e scrittura su disco
+	blk_request_vq = virtq_init(0);
+	// 6 set DRIVER_OK status bit: possiamo adesso utilizzare il device
+	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
+
+
+	// get the disk capacity
+	blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+	printf("virtio-blk: capacity is %d bytes\n", (int)blk_capacity);
+
+	// allochiamo una regione per memorizzare le richieste verso il device
+
+	blk_req_paddr = alloc_pages((uint32_t)align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+	blk_req = (struct virtio_blk_req *) blk_req_paddr;
+}
+
+struct virtio_virtq *virtq_init(unsigned index){
+	// allochiamo una regione per virtqueue
+	paddr_t virtq_paddr = alloc_pages((uint32_t)align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+	struct virtio_virtq *vq = (struct virtio_virtq *) virtq_paddr;
+	vq->queue_index = index;
+	vq->used_index = (volatile uint16_t *) &vq->used.index;
+
+	// select the queue: scriviamo il virtqueue index (il primo è 0)
+	virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+	// specifichiamo la dimensione della coda: scriviamo il numero di descrittori che utilizziamo
+	virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+	// scriviamo il page frame number fisico della coda.
+	virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr /PAGE_SIZE);
+	
+	return vq;
+}
+
 
 
 // page table
@@ -266,6 +359,8 @@ struct process *create_process(const void *image, size_t image_size){
 	for (paddr_t paddr = (paddr_t) __kernel_base;
 		 paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+	
+	map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
 	 
 	// Map delle pagine user
 

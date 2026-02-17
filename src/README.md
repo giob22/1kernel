@@ -1835,25 +1835,25 @@ long getchar(void){
 <!-- embed:file="kernel.c" line="509-527"-->
 [Source: kernel.c](kernel.c#L509-L527)
 ```c
-void handle_syscall(struct trap_frame *f){
-	switch (f->a3){
-		case SYS_PUTCHAR:
-			putchar(f->a0);
-			break;
-		case SYS_GETCHAR:
-			while (1) {
-				// polling
-				long ch = getchar();
-				if (ch >= 0){
-					f->a0 = ch;
-					break;
-				}
-				yield();
-			}
-			break;
-		case SYS_EXIT:
-			printf("process %d exited\n", current_proc->pid);
-			current_proc->state = PROC_EXITED;
+"lw t5,  4 * 8(sp)\n"
+"lw t6,  4 * 9(sp)\n"
+"lw a0,  4 * 10(sp)\n"
+"lw a1,  4 * 11(sp)\n"
+"lw a2,  4 * 12(sp)\n"
+"lw a3,  4 * 13(sp)\n"
+"lw a4,  4 * 14(sp)\n"
+"lw a5,  4 * 15(sp)\n"
+"lw a6,  4 * 16(sp)\n"
+"lw a7,  4 * 17(sp)\n"
+"lw s0,  4 * 18(sp)\n"
+"lw s1,  4 * 19(sp)\n"
+"lw s2,  4 * 20(sp)\n"
+"lw s3,  4 * 21(sp)\n"
+"lw s4,  4 * 22(sp)\n"
+"lw s5,  4 * 23(sp)\n"
+"lw s6,  4 * 24(sp)\n"
+"lw s7,  4 * 25(sp)\n"
+"lw s8,  4 * 26(sp)\n"
 ```
 <!-- embed:end -->
 
@@ -1990,4 +1990,303 @@ La chiamata di sistema modifica lo stato del processo in `PROC_EXITED` e richiam
 
 --- 
 
-Aggiungiamo il comando `exit` alla shell
+Aggiungiamo il comando `exit` alla shell.
+
+
+## disk I/O
+
+Implementiamo un driver per *vrtio-blk*, un virtual disk device.
+
+Virtio è una interfaccia standard per dispositivi virtuali. In altre parole, è una delle API che consentono ai driver di controllare i dispositivi.
+
+Così come si utilizza HTTP per accedere ai sever web, si utilizza Virtio per accedere ai dispositivi Virtio.
+
+### virtqueue
+
+I dispositivi Virtio hanno una struttura chiamata *virtqueue*. Si tratta di una coda condivisa tra il driver e il dispositivo.
+
+Tale coda virtuale è composta da diverse aree:
+
+|Name|Written by|Content|Contets|
+|:--|:--|:--|:--|
+|Descriptor table|Driver|Una tabella di descrittori: l'indirizzo e la dimensione della richiesta|Indirizzo di memoria, lunghezza, indice del descrittore successivo|
+|Avaiable Ring|Driver|Elaborazione delle richieste al dispositivo|Indice principale della catena dei descrittori|
+|Using Ring|Device|Elaborazione delle richieste gestite dal dispositivo|Indice principale della catena dei descrittori|
+
+Quindi la virtqueue è divisa in tre parti:
+
+1) Descrittori, indicano dove si trovano i dati e contengono info sui metadati
+2) Avaiable Ring, indica che operazione il dispositivo deve eseguire (richieste in attesa)
+3) Used Ring, output del dispositivo (richeiste completate)
+
+![schema_virtio](https://operating-system-in-1000-lines.vercel.app/assets/virtio.DFEgeSrL.svg)
+
+Ogni richiesta è composta da più descrittori, chiamati catena dei descrittori. Suddividendoli in più descrittori, è possibile specificare dati di memoria sparsi o assegnare descrittori di attributi diversi.
+
+Ad esempio, quando si scrive su un disco, virtqueue verrà utilizzato come segue:
+
+- Il diver scrive una richiesta di lettura/scrittura nella tabella dei descrittori
+- Il driver aggiunge l'indice del descrittore principale nel Avaiable ring
+- Il driver notifica al dispositivo che è presente una nuova richiesta
+- Il dispositivo legge una richiesta dall'avaiable ring
+- Il dispositivo scrive l'indice del descrittore nel Used Ring e notifica al driver che l'operazione è completata.
+
+### enable virtio devices
+
+Prima di scrivere un device driver, prepariamo un file di test. Creiamo un dile chiamata `lorem.txt` e riempiamolo con del testo casuale.
+
+Inoltre colleghiamo un dispositivo *virtio-blk* a QEMU:
+
+<!-- embed:file="run.sh" line="30-34" lock="true"-->
+[Source: run.sh](run.sh#L30-L34)
+```bash
+$QEMU -machine virt -bios default -nographic -serial mon:stdio --no-reboot \
+	-d unimp,gues_errors,int,cpu_reset -D qemu.log \
+	-drive id=drive0,file=lorem.txt,format=raw,if=none \
+	-device virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0 \
+	-kernel kernel.elf
+```
+<!-- embed:end -->
+
+Le nuove opzioni aggiunte sono:
+
+- `-drive id=drive0`: definisce il disco denominato `drive0`, con `lorem.txt` come immagine del disco. Il formato dell'immagine è `raw` (tratta il contenuto del file così com'è, come dati del disco).
+- `-device virtio-blk-device`: aggiunge un dispositivo virtio-blk con disk `drive0`. `bus=virtio-mmio-bus.0` mappa il dispositivo in un bus virtio-mmio (virtio over Memory Mapped I/O).
+
+### define C macros/struct
+
+Per prima cosa aggiungiamo alcune definizioni relative a virtio in `kernel.h`.
+
+<!-- embed:file="kernel.h" line="6-77" withLineNumbers="true" lock="true"-->
+[Source: kernel.h](kernel.h#L6-L77)
+```c
+ 6: #define SECTOR_SIZE 512
+ 7: #define VIRTQ_ENTRY_NUM 16
+ 8: #define VIRTIO_DEVICE_BLK 2
+ 9: #define VIRTIO_BLK_PADDR 0x10001000
+10: #define VIRTIO_REG_MAGIC 0x00
+11: #define VIRTIO_REG_VERSION 0x04
+12: #define VIRTIO_REG_DEVICE_ID 0x08
+13: #define VIRTIO_REG_PAGE_SIZE 0x28
+14: #define VIRTIO_REG_QUEUE_SEL 0x30
+15: #define VIRTIO_REG_QUEUE_NUM_MAX 0x34
+16: #define VIRTIO_REG_QUEUE_NUM 0x38
+17: #define VIRTIO_REG_QUEUE_PFN 0x40
+18: #define VIRTIO_REG_QUEUE_READY 0x44
+19: #define VIRTIO_REG_QUEUE_NOTIFY 0x50
+20: #define VIRTIO_REG_DEVICE_STATUS 0x70
+21: #define VIRTIO_REG_DEVICE_CONFIG 0x100
+22: #define VIRTIO_STATUS_ACK 1
+23: #define VIRTIO_STATUS_DRIVER 2
+24: #define VIRTIO_STATUS_DRIVER_OK 4
+25: #define VIRTQ_DESC_F_NEXT 1
+26: #define VIRTQ_DESC_F_WRITE 2
+27: #define VIRTQ_AVAIL_F_NO_INTERRUPT 1
+28: #define VIRTIO_BLK_T_IN 0
+29: #define VIRTIO_BLK_T_OUT 1
+30: 
+31: // virtqueue Descriptor table entry
+32: struct virtq_desc{
+33:     uint64_t addr;
+34:     uint32_t len;
+35:     uint16_t flags;
+36:     uint16_t next;
+37: }__attribute__((packed));
+38: 
+39: // virtqueue Avaiable Ring
+40: struct virtq_avail{
+41:     uint16_t flags;
+42:     uint16_t index;
+43:     uint16_t ring[VIRTQ_ENTRY_NUM];
+44: }__attribute__((packed));
+45: 
+46: // virtqueue Used Ring entry
+47: struct virtq_used_elem{
+48:     uint32_t id;
+49:     uint32_t len;
+50: }__attribute__((packed));
+51: 
+52: // virtqueue used ring
+53: struct virtq_used{
+54:     uint16_t flags;
+55:     uint16_t index;
+56:     struct virtq_used_elem ring[VIRTQ_ENTRY_NUM];
+57: }__attribute__((packed));
+58: 
+59: // Virtqueue
+60: 
+61: struct virtio_virtq{
+62:     struct virtq_desc descs[VIRTQ_ENTRY_NUM];
+63:     struct virtq_avail avail;
+64:     struct virtq_used used __attribute__((aligned(PAGE_SIZE)));
+65:     int queue_index;
+66:     volatile uint16_t *used_index;
+67:     uint16_t last_used_index;
+68: }__attribute__((packed));
+69: 
+70: // Virtio-blk request
+71: struct virtio_blk_req {
+72:     uint32_t type;
+73:     uint32_t reserved;
+74:     uint64_t sector;
+75:     uint8_t data[512];
+76:     uint8_t status;
+77: }__attribute__((packed));
+```
+<!-- embed:end -->
+
+>`__attribute__((packed))` è un'estensione del compilatore che indica al compilatore di comprimere i membri della struttura senza *padding*. 
+>
+>In caso contrario, il compilatore potrebbe aggiungere byte di padding nascosti e il driver/dispositivo potrebbe visualizzare valori errati.
+
+Successivamente aggiungiamo le funzioni di utilità a `kernel.c` per accedere ai registri MIMIO.
+
+<!-- embed:file="kernel.c" line="204-219" withLineNumbers="true" lock="true"-->
+[Source: kernel.c](kernel.c#L204-L219)
+```c
+204: // disk I/O
+205: uint32_t virtio_reg_read32(unsigned offset){
+206: 	return *((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset));
+207: }
+208: 
+209: uint64_t virtio_reg_read64(unsigned offset){
+210: 	return *((volatile uint64_t *)(VIRTIO_BLK_PADDR + offset));
+211: }
+212: 
+213: void virtio_reg_write32(unsigned offset, uint32_t value){
+214: 	*((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset)) = value;
+215: }
+216: 
+217: void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value){
+218: 	virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+219: }
+```
+<!-- embed:end -->
+
+L'accesso ai registri MMIO non è lo stesso dell'accesso alla memoria normale. È consigliabile utilizzare la parola chiave `volatile` per impedire al compilatore di ottimizzare le operazioni di lettura/scrittura.
+
+In MMIO, l'accesso alla memoria può innescare effetti collaterali (ad esempio, invio di un comando al dispositivo).
+
+### map the MMIO region
+
+Per prima cosa, dobbiamo mappare la regione MMIO `virtio-blk` nella tabella delle pagine in modo che il kernel possa accedere ai registri MMIO.
+
+<!-- embed:file="kernel.c" line="335-340" withLineNumbers="true" new="340" lock="true" -->
+[Source: kernel.c](kernel.c#L335-L340)
+```c
+335: uint32_t * page_table = (uint32_t *) alloc_pages(1);
+336: for (paddr_t paddr = (paddr_t) __kernel_base;
+337: 	 paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+338: 	map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+339: 
+340: map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W); // NEW
+```
+<!-- embed:end -->
+
+### virtio device initialization
+
+Il processo di inizializzazione è descritto nelle specifiche come segue:
+
+- reimpostare il dispositivo. Questa operazione non è necessaria al primo avvio.
+- il bit di stato `ACKNOWLEDGE` è impostato: abbiamo rilevato il dispositivo.
+- il bit di stato `DRIVER` è impostato: sappiamo come pilotare il dispositivo
+- configurazione specifica del dispositivo, inclusa la lettura dei bit delle funzionalità del dispositivo, l'individuazione delle code virtuali per il dispositivo, la configurazione MSI-X facoltativa e la lettura e l'eventuale scrittura dello spazio di configurazione virtio.
+- sottoinsieme di bit delle funzionalità del dispositivo riconosciuti dal driver viene scritto nel dispositivo.
+- il bit di stato `DRIVER_OK` è impostato.
+- il dispositivo, ora, può esser utilizzato.
+
+<!-- embed:file="kernel.c" line="222-252" lock="true" -->
+[Source: kernel.c](kernel.c#L222-L252)
+```c
+void virtio_blk_init(void){
+	if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
+		PANIC("virtio: invalid magic value");
+	if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
+		PANIC("virtio: invalid version");
+	if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
+		PANIC("virtio: invalid device id");
+	
+	// 1 reset the device
+	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+	// 2 set the ACKNOWLEDGE status bit: Abbiamo trovato il device
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+	// 3 set the DRIVER status bit: Conosciamo come utilizzare il device
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
+	// 4 set our page size: utilizziamo pagine di 4KB. Questo definisce il PFN (page frame number) calculation
+	virtio_reg_write32(VIRTIO_REG_PAGE_SIZE, PAGE_SIZE);
+	// 5 inizializiamo una coda per le richieste di lettura e scrittura su disco
+	blk_request_vq = virtq_init(0);
+	// 6 set DRIVER_OK status bit: possiamo adesso utilizzare il device
+	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
+
+
+	// get the disk capacity
+	blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+	printf("virtio-blk: capacity is %d bytes\n", (int)blk_capacity);
+
+	// allochiamo una regione per memorizzare le richieste verso il device
+
+	blk_req_paddr = alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+	blk_req = (struct virtio_blk_req *) blk_req_paddr;
+}
+```
+<!-- embed:end -->
+
+La funzione `virtq_init` è ancora da implementare, la implementeremo a breve.
+
+Inizializziamo il dispositivo in `kernel_main`:
+
+<!-- embed:file="kernel.c" line="109-114" withLineNumbers="true" new="114" lock="true" -->
+[Source: kernel.c](kernel.c#L109-L114)
+```c
+109: void kernel_main(void) {
+110: 	memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+111: 	memset(procs, 0, sizeof(procs)); // Explicitly clear procs to ensure clean state
+112: 	WRITE_CSR(stvec, (uint32_t)kernel_entry);
+113: 	
+114: 	virtio_blk_init();                                                               // NEW
+```
+<!-- embed:end -->
+
+Questo è un tipico schema di inizializzazione per i driver di dispositivi.
+
+Reimpostare il dispositivo, impostare i parametri, quindi abilitare il dispositivo.
+
+### `virtqueue` initialization
+
+Una `virtqueue` dovrebbe esser inizializzata come segue:
+
+- scrivere l'indice `virtqueue` (la prima coda è `0`) nel campo Queue Select.
+- leggere la dimensione della coda virtuale dal capo Queue Size, che è sempre una potenza di `2`.
+- allocare e azzerare la coda virtuale nella memoria fisica contigua, con un allineamento di 4096 byte
+
+<!-- embed:file="kernel.c" line="262-277" withLineNumbers="true" lock="true" -->
+[Source: kernel.c](kernel.c#L262-L277)
+```c
+262: struct virtio_virtq *virtq_init(unsigned index){
+263: 	// allochiamo una regione per virtqueue
+264: 	paddr_t virtq_paddr = alloc_pages((uint32_t)align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+265: 	struct virtio_virtq *vq = (struct virtio_virtq *) virtq_paddr;
+266: 	vq->queue_index = index;
+267: 	vq->used_index = (volatile uint16_t *) &vq->used.index;
+268: 
+269: 	// select the queue: scriviamo il virtqueue index (il primo è 0)
+270: 	virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+271: 	// specifichiamo la dimensione della coda: scriviamo il numero di descrittori che utilizziamo
+272: 	virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+273: 	// scriviamo il page frame number fisico della coda.
+274: 	virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr /PAGE_SIZE);
+275: 	
+276: 	return vq;
+277: }
+```
+<!-- embed:end --> 
+
+Questa funzione alloca una regione di memoria per una coda virtuale e ne comunica l'indirizzo fisico al dispositivo.
+
+Il dispositivo utilizzerà questa regione di memoria per le richieste di lettura/scrittura.
+
+> Ciò che i driver fanno durante il processi di inizializzazione è verificare le capacità/caratteristiche del dispositivo, allocare le risorse del sistema operativo (ad esempio, regioni di memoria) e impostare i parametri.
+>
+
+
