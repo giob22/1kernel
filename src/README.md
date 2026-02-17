@@ -1835,25 +1835,25 @@ long getchar(void){
 <!-- embed:file="kernel.c" line="509-527"-->
 [Source: kernel.c](kernel.c#L509-L527)
 ```c
-"lw t5,  4 * 8(sp)\n"
-"lw t6,  4 * 9(sp)\n"
-"lw a0,  4 * 10(sp)\n"
-"lw a1,  4 * 11(sp)\n"
-"lw a2,  4 * 12(sp)\n"
-"lw a3,  4 * 13(sp)\n"
-"lw a4,  4 * 14(sp)\n"
-"lw a5,  4 * 15(sp)\n"
-"lw a6,  4 * 16(sp)\n"
-"lw a7,  4 * 17(sp)\n"
-"lw s0,  4 * 18(sp)\n"
-"lw s1,  4 * 19(sp)\n"
-"lw s2,  4 * 20(sp)\n"
-"lw s3,  4 * 21(sp)\n"
-"lw s4,  4 * 22(sp)\n"
-"lw s5,  4 * 23(sp)\n"
-"lw s6,  4 * 24(sp)\n"
-"lw s7,  4 * 25(sp)\n"
-"lw s8,  4 * 26(sp)\n"
+	switch_context(&prev->sp, &next->sp);
+}
+
+
+// page allocator
+paddr_t alloc_pages(uint32_t n){
+	static paddr_t next_paddr = (paddr_t)__free_ram;
+	paddr_t paddr = next_paddr;
+	next_paddr += n * PAGE_SIZE;
+	
+	if (next_paddr > (paddr_t) __free_ram_end)
+	PANIC("out of memory");
+	
+	memset((void*)paddr, 0, n * PAGE_SIZE);
+
+	return paddr;
+}
+
+
 ```
 <!-- embed:end -->
 
@@ -2288,5 +2288,150 @@ Il dispositivo utilizzerà questa regione di memoria per le richieste di lettura
 
 > Ciò che i driver fanno durante il processi di inizializzazione è verificare le capacità/caratteristiche del dispositivo, allocare le risorse del sistema operativo (ad esempio, regioni di memoria) e impostare i parametri.
 >
+
+### sending I/O requests
+
+Abbiamo un dispositivo `virtio-blk` inizializzato. Inviamo una richiesta di I/O al disco.
+
+Le richieste di I/O al disco vengono implementate aggiungendo una richiesta di elaborazione alla coda virtuale. Lo facciamo implementando la funzione `virtq_kick` che notifica al device che è presente una nuova richiesta.
+
+In particolar modo riferisce l'indice del primo descrittore della nuova richiesta.
+
+<!-- embed:file="kernel.c" line="299-345" withLineNumbers="true" lock="true" -->
+[Source: kernel.c](kernel.c#L299-L345)
+```c
+299: void read_write_disk(void *buf, unsigned sector, int is_write){
+300: 	if (sector > blk_capacity / SECTOR_SIZE){
+301: 		printf("virtio: tried to read/write sector=%d, but capacity id %d\n", sector, blk_capacity / SECTOR_SIZE);
+302: 		return;
+303: 	}
+304: 
+305: 	// costruiamo la richiesta in accordo con le specifiche di virtio-blk
+306: 	blk_req->sector = sector;
+307: 	blk_req->type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+308: 	if (is_write)
+309: 		memcpy(blk_req->data, buf, SECTOR_SIZE);
+310: 
+311: 	// costruiamo i descrittori della virtqueue (utilizziamo 3 descrittori)
+312: 	struct virtio_virtq *vq = blk_request_vq;
+313: 	vq->descs[0].addr = blk_req_paddr;
+314: 	vq->descs[0].len = sizeof(uint32_t) * 2 + sizeof(uint64_t); 
+315: 	vq->descs[0].flags = VIRTQ_DESC_F_NEXT;
+316: 	vq->descs[0].next = 1;
+317: 
+318: 	vq->descs[1].addr = blk_req_paddr + offserof(struct virtio_blk_req, data);
+319: 	vq->descs[1].len = SECTOR_SIZE;
+320: 	vq->descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? 0 : VIRTQ_DESC_F_WRITE);
+321: 	vq->descs[1].next = 2;
+322: 
+323: 	vq->descs[2].addr = blk_req_paddr + offserof(struct virtio_blk_req, status);
+324: 	vq->descs[2].len = sizeof(uint8_t);
+325: 	vq->descs[2].flags = VIRTQ_DESC_F_WRITE;
+326: 
+327: 	// notifichiamo il device che c'è una nuova richiesta
+328: 	virtq_kick(vq, 0);
+329: 	
+330: 
+331: 	// aspettiamo finché il device non finisce l'elaborazione
+332: 	// POLLING (sarebbe da evitare)
+333: 	while (virtq_is_busy(vq))
+334: 		;
+335: 	
+336: 	// virtio-blk: if a none zero value is returned, it's an error
+337: 	if (blk_req->status != 0) {
+338: 		printf("virtio: warn: failed to read/write sector=%d status=%d\n", sector, blk_req->status);
+339: 		return;
+340: 	}
+341: 
+342: 	// for read operation, copy the data into the buffer
+343: 	if (!is_write)
+344: 		memcpy(buf, blk_req->data, SECTOR_SIZE);
+345: }
+```
+<!-- embed:end -->
+
+`offserof` è una macro che mi permette di valutare quanti byte rispetto l'indirizzo base di una struttara è presente un determinato campo.
+
+Una richiesta viene inviata nei seguenti passaggi:
+
+- Costruzione di una richiesta in `blk_req`. Specifica il numero del settore a cui vuoi accedere e il tipo di lettura/scrittura.
+- Costruzione di una catena di descrittori che punti a ciascuna area `blk_req`
+- Aggiungere l'indice del descrittore principale della catena di descrittori nel Avaiable Ring disponibile
+- Avvisare il dispositivo che c'è una nuova richiesta in sospeso
+- Attende che il dispositivo termini l'elaborazione (noto anche come *busy-waiting* o *polling*)
+- Controllare la risposta del dispositivo
+
+Nella funzione stiamo creado una catena di descrittori composta da 3 descrittori. Abbiamo quindi bisogno di 3 descrittori perché ognuno ha attributi (`flags`) diversi:
+
+<!-- embed:file="kernel.h" line="70-82" lock="true" -->
+[Source: kernel.h](kernel.h#L70-L82)
+```c
+// Virtio-blk request
+struct virtio_blk_req {
+    // primo descrittore: read-only from the device 
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t sector;
+    
+    // secondo descrittore writable by the device if it's a read operation (VIRTQ_DESC_F_WRITE)
+    uint8_t data[512];
+    
+    // terzo descrittore: writable by the device (VIRTQ_DESC_F_WRITE)
+    uint8_t status;
+}__attribute__((packed));
+```
+<!-- embed:end -->
+
+Poiché ogni volta attendiamo il completamento dell'elaborazione, possiamo semplicemente utilizzare i primi 3 descrittori nell'anello. 
+
+Tuttavia, in pratica, è necessario tenere traccia dei descrittori liberi/utilizzati per l'elaborare più richieste contemporaneamente.
+
+### test
+
+<!-- embed:file="kernel.c" line="118-132" withLineNumbers="true" new="125-127,131-132" lock="true" -->
+[Source: kernel.c](kernel.c#L118-L132)
+```c
+118: void kernel_main(void) {
+119: 	memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+120: 	memset(procs, 0, sizeof(procs)); // Explicitly clear procs to ensure clean state
+121: 	WRITE_CSR(stvec, (uint32_t)kernel_entry);
+122: 	
+123: 	virtio_blk_init();
+124: 
+125: 	char buf[SECTOR_SIZE];                                                           // NEW
+126: 	read_write_disk(buf, 0, false /* read from the disk */);                         // NEW
+127: 	printf("first sector: %s\n", buf);                                               // NEW
+128: 
+129: 
+130: 	
+131: 	strcpy(buf, "hello from kernel!!!\n");                                           // NEW
+132: 	read_write_disk(buf, 0, true /* write to the disk */);                           // NEW
+```
+<!-- embed:end -->
+
+Poiché specifichiamo `lorem.txt` come immagine del disco (raw), il suo contenuto dovrebbe essere visualizzato così com'è:
+
+
+```bash
+$ ./run.sh
+
+virtio-blk: capacity is 2560 bytes
+first sector: Lorem ipsum dolor sit amet consectetur adipisicing elit. Ex perspiciatis voluptate itaque dolorum, error commodi nam cupiditate consequatur illo voluptatibus sapiente, eveniet exercitationem sit accusamus inventore perferendis aliquid nihil doloremque?
+```
+
+Inoltre il primo settore viene sovrascitto con la stringa "hello from kernel!!!":
+
+```bash
+$ head ./lorem.txt
+hello from kernel!!!
+amet consectetur adipisicing elit. Ex perspiciatis voluptate itaque dolorum, error commodi nam cupiditate consequatur illo voluptatibus sapiente, eveniet exercitationem sit accusamus inventore perferendis aliquid nihil doloremque?
+```
+
+I driver di dispositivi sono solo un "collante" tra il sistema operativo e i dispositivi. I driver non controllano direttamente l'hardware; comunicano con altri software in esecuzione sul dispositivo (ad esempio il firmware). 
+
+I dispositivi e i loro software, non il driver del sistema operativo, si occuperanno del resto del lavoro pesante, come lo spostamento delle testine di lettura/scrittura del disco.
+
+
+
 
 
