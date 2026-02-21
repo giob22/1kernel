@@ -1835,25 +1835,25 @@ long getchar(void){
 <!-- embed:file="kernel.c" line="509-527"-->
 [Source: kernel.c](kernel.c#L509-L527)
 ```c
-	switch_context(&prev->sp, &next->sp);
+		:
+		: [sepc] "r" (USER_BASE),
+			[sstatus] "r" (SSTATUS_SPIE | SSTATUS_SUM)
+	);
+	
 }
 
 
-// page allocator
-paddr_t alloc_pages(uint32_t n){
-	static paddr_t next_paddr = (paddr_t)__free_ram;
-	paddr_t paddr = next_paddr;
-	next_paddr += n * PAGE_SIZE;
+// prepara un nuovo processo per eseguire
+struct process *create_process(const void *image, size_t image_size){
+	// find an unused process control structure
 	
-	if (next_paddr > (paddr_t) __free_ram_end)
-	PANIC("out of memory");
-	
-	memset((void*)paddr, 0, n * PAGE_SIZE);
-
-	return paddr;
-}
-
-
+	struct process *proc = NULL;
+	int i = 0;
+	for (i = 0; i < PROCS_MAX; i++){
+		if  (procs[i].state == PROC_UNUSED) {
+			proc = &procs[i];
+			break;
+		}
 ```
 <!-- embed:end -->
 
@@ -2383,19 +2383,19 @@ Nella funzione stiamo creado una catena di descrittori composta da 3 descrittori
 <!-- embed:file="kernel.h" line="70-82" lock="false" -->
 [Source: kernel.h](kernel.h#L70-L82)
 ```c
-// Virtio-blk request
-struct virtio_blk_req {
-    // primo descrittore: read-only from the device 
-    uint32_t type;
-    uint32_t reserved; // PADDING (spazio vuoto richiesto dallo standard)
-    uint64_t sector;
-    
-    // secondo descrittore writable by the device if it's a read operation (VIRTQ_DESC_F_WRITE)
-    uint8_t data[512];
-    
-    // terzo descrittore: writable by the device (VIRTQ_DESC_F_WRITE)
-    uint8_t status;
+    uint16_t flags;
+    uint16_t next;
 }__attribute__((packed));
+
+// virtqueue Avaiable Ring
+struct virtq_avail{
+    uint16_t flags;
+    uint16_t index;
+    uint16_t ring[VIRTQ_ENTRY_NUM];
+}__attribute__((packed));
+
+// virtqueue Used Ring entry
+struct virtq_used_elem{
 ```
 <!-- embed:end -->
 
@@ -2447,6 +2447,449 @@ amet consectetur adipisicing elit. Ex perspiciatis voluptate itaque dolorum, err
 I driver di dispositivi sono solo un "collante" tra il sistema operativo e i dispositivi. I driver non controllano direttamente l'hardware; comunicano con altri software in esecuzione sul dispositivo (ad esempio il firmware). 
 
 I dispositivi e i loro software, non il driver del sistema operativo, si occuperanno del resto del lavoro pesante, come lo spostamento delle testine di lettura/scrittura del disco.
+
+## file system
+
+Adottiamo un approccio interessante per implementare un file system: utilizzare un file `tar` come nostro file system.
+
+`Tar` è un formato di archivio che può contenere più file. Contiene contenuti dei file, nomi file, date di creazione e altre informazioni necessarie per un file system.
+
+Rispetto ai formati di file system comuni come FAT o ext2, `tar` ha una struttura dati molto più semplice. Inoltre, puoi manipolare l'immagine del file system usando il comando `tar`.
+
+Oggigiorn, tar viene utilizzato come alternativa a ZIP, ma originariamente nacque come una sorta di file system per il nastro magnetico.
+
+### create a disk image (tar file)
+
+Iniziamo preparando il contenuto del nostro file system. Creiamo una directory chiamata `disk` e aggiungiamoci alcuni file.
+
+```bash
+mkdir disk
+vim hello.txt
+...
+```
+
+Aggiungiamo un comando al build script per creare un file tar e passarlo come immagine disco a QEMU.
+
+<!-- embed:file="run.sh" line="28-36" withLineNumbers="true" new="34,28" lock="true" -->
+[Source: run.sh](run.sh#L28-L36)
+```bash
+28: (cd disk && tar cf ../disk.tar --format=ustar *.txt)                         # NEW
+29: 
+30: # start qemu
+31: 
+32: $QEMU -machine virt -bios default -nographic -serial mon:stdio --no-reboot \
+33: 	-d unimp,guest_errors,int,cpu_reset -D qemu.log \
+34: 	-drive id=drive0,file=disk.tar,format=raw,if=none \                         # NEW
+35: 	-device virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0 \
+36: 	-kernel kernel.elf
+```
+<!-- embed:end -->
+
+Le opzioni del comando `tar` utilizzate sono:
+
+- `cf`: crea il file `.tar`
+- `--format=ustar`: crea in formato *ustar*
+
+> Le parentesi `(...)` creano una sottoshell in modo che `cd` non influenzi altre parti dello script.
+
+### tar file structure
+
+Un file tar ha la seguente struttura:
+
+```console
++----------------+
+|   tar header   |
++----------------+
+|   file data    |
++----------------+
+|   tar header   |
++----------------+
+|   file data    |
++----------------+
+|      ...       |
+```
+
+In sintesi, un file tar è essenzialmente una serie di coppie di *tar header* e *file data*, una coppia per ciascun file.
+
+Questo è il formato *ustar*, uno dei vari formati utilizzabili con tar.
+
+Usiamo questa file structure come struttura dati per il nostro file system. Ovviamente questo file system è ben lontano dai file system standard che utilizziamo quotidianamente.
+
+### reading the file system
+
+Per prima cosa, definiamo le strutture dati relative al tar file system in `kernel.h`:
+
+<!-- embed:file="kernel.h" line="4-35" -->
+[Source: kernel.h](kernel.h#L4-L35)
+```c
+//* file system macro and struct
+
+#define FILES_MAX 2
+#define DISK_MAX_SIZE align_up(sizeof(struct file) * FILES_MAX, SECTOR_SIZE)
+
+struct tar_header {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char type;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char padding[12];
+    char data[]; // array pointing to the data area following the header. È un array a lunghezza variabile.
+}__attribute__((packed));
+
+struct file {
+    bool in_use;    // indica se il file entry è in uso o meno
+    char name[100]; // file name
+    char data[1024]; // contenuto del file
+    size_t size; // dimensione del file
+};
+```
+<!-- embed:end -->
+
+Nella nostra implementazione del file system, tutti i file vengono letti dal disco in memoria all'avvio. `FILE_MAX` definisce il numero massimo di file che possono essere caricati e `DISK_MAX_SIZE` specifica la dimensione massima dell'immagine disco.
+
+Leggiamo l'intero disco in memoria, implementando la funzione in `kernel.c`
+
+<!-- embed:file="kernel.c" line="10-11" new="10,11" lock="true"-->
+[Source: kernel.c](kernel.c#L10-L11)
+```c
+struct file files[FILES_MAX]; // NEW
+uint8_t disk[DISK_MAX_SIZE];  // NEW
+```
+<!-- embed:end -->
+
+236-271
+<!-- embed:file="kernel.c" line="236-271" withLineNumbers="true" lock="true"-->
+[Source: kernel.c](kernel.c#L236-L271)
+```c
+236: // file stystem
+237: int oct2int(char *oct, int len){
+238: 	int dec = 0;
+239: 
+240: 	for(int i = 0; i < len; i++){
+241: 		if (oct[i] < '0' || oct[i] > 7)
+242: 			break;
+243: 		
+244: 		dec = dec * 8 + (oct[i] - '0');
+245: 	}
+246: 	return dec;
+247: }
+248: 
+249: void fs_init(void){
+250: 	for (unsigned sector = 0; sector < sizeof(disk) / SECTOR_SIZE; sector++)
+251: 		read_write_disk(&disk[sector * SECTOR_SIZE], sector, false);
+252: 	
+253: 		
+254: 	unsigned off = 0;
+255: 	for (int i = 0; i < FILES_MAX; i++){
+256: 		struct tar_header *header = (struct tar_header *) &disk[off];
+257: 		if (header->name[0] == '\0')
+258: 			break;
+259: 		if (strcmp(header->magic, "ustar") != 0)
+260: 			PANIC("invalid tar header: magic=\"%s\"", header->magic);
+261: 		int filesz = oct2int(header->size, sizeof(header->size));
+262: 		struct file *file = &files[i];
+263: 		file->in_use = true;
+264: 		strcpy(file->name, header->name);
+265: 		memcpy(file->data, header->data, filesz);
+266: 		file->size = filesz;
+267: 		printf("file: %s, size=%d\n", file->name, file->size);
+268: 
+269: 		off += align_up(sizeof(struct tar_header) + filesz, SECTOR_SIZE);
+270: 	}
+271: }
+```
+<!-- embed:end -->
+
+In questa funzione, usiamo la funzione `read_write_disk` per caricare l'immagine del disco in un buffer temporaneo (`disk`). `disk` viene dichiarata come variabile statica invece che come variabile locale (stack). Questo perché lo stack ha dimensioni limitate, ed è preferibile evitare di usarlo per grandi aree dati.
+
+Dopo aver caricato il contenuto del disco, copiamo in sequenza in strutture `files`.
+
+Si nota che i numeri nell'intestazione tar sono in formato ottale. È molto confuso perché sembra un decimale.
+
+La funzione `oct2int` viene utilizzata per convertire questi valori della stringa ottale in interi.
+
+Infine assicuriamoci di chiamare la funzione `fs_init` dopo aver inizializzato il dispositivo virtio-blk (`virtio_blk_init`) in `kernel_main`:
+
+<!-- embed:file="kernel.c" line="127-134" new="134" lock="true" -->
+[Source: kernel.c](kernel.c#L127-L134)
+```c
+// * main
+void kernel_main(void) {
+	memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+	memset(procs, 0, sizeof(procs)); // Explicitly clear procs to ensure clean state
+	WRITE_CSR(stvec, (uint32_t)kernel_entry);
+	
+	virtio_blk_init();
+	fs_init();                                                                       // NEW
+```
+<!-- embed:end -->
+
+### test file reads
+
+Dovrebbe stampare i nomi dei file e le loro dimensioni nella cartella `/disk`.
+
+```bash
+virtio-blk: capacity is 10240 bytes
+file: bau.txt, size=8
+file: hello.txt, size=14
+```
+
+### writing to the disk
+
+La scrittura del file può essere implementata scrivendo il contenuto della variabile `file` nel disco in formato tar:
+
+<!-- embed:file="kernel.c" region="write-to-the-disk" lock="true"-->
+[Source: kernel.c](kernel.c#L17-L63)
+```c
+void fs_flush(void){
+	// copiamo il contenuto di tutti i file su disk
+
+	memset(disk, 0, sizeof(disk));
+
+	unsigned off = 0;
+	for(int file_i = 0; file_i < FILES_MAX, file_i){
+		struct file *file = &files[file_i];
+		if (!file->in_use)
+			continue;
+	
+		struct tar_header *header = (struct tar_header *) &disk[off];
+
+		memset(header, 0, sizeof(*header));
+		strcpy(header->name, file->name);
+		strcpy(header->mode, "000644");
+		strcpy(header->magic, "ustar");
+		strcpy(header->version, "00");
+		header->type = '0';
+
+		// convertiamo il file size in una stringa in ottale
+		int filesz = file->size;
+		for (int i = sizeof(header->size); i > 0; i--){
+			header->size[i - 1] = (filesz % 8) + '0';
+			filesz /= 8;
+		}
+
+		// calcoliamo la checksum
+		int checksum = ' ' * sizeof(header->checksum);
+		for (unsigned i = 0; i < sizeof(struct tar_header); i++){
+			checksum += (unsigned char) disk[off +i];
+		}
+		for (int i = 5; i >= 0; i--){
+			header->checksum[i] = (checksum % 8) + '0';
+			checksum /= 8;
+		}
+		// copiamo i dati del file
+		memcpy(header->data, file->data, file->size);
+		off += align_up(sizeof(struct tar_header) + file->size, SECTOR_SIZE),
+	}
+
+	// scriviamo il buffer che abbiamo creato in virtio-blk
+	for (unsigned sector = 0; sector < sizeof(disk) / SECTOR_SIZE; sector++)
+		read_write_disk(&disk[sector * SECTOR_SIZE], sector, true);
+		
+	printf("wrote %d byte to disk\n", sizeof(disk));
+}
+```
+<!-- embed:end -->
+
+In questa funzione, un file tar viene costruito nella variabile `disk`, poi scritto sul disco usando la funzione `read_write_disk`.
+
+### design file read/write system calls
+
+Ora che abbiamo implementato operazioni di lettura e scrittura del file system, rendiamo possibile alle applicazioni di leggere e scrivere file.
+
+- `readfile`
+- `writefile`
+
+Entrambi prendono come argomento il nome del file, un buffer di memoria per la lettura o la scrittura e la dimensione del buffer.
+
+<!-- embed:file="common.h" line="35-36" new="35,36" lock="true" -->
+[Source: common.h](common.h#L35-L36)
+```c
+#define SYS_READFILE 4  // NEW
+#define SYS_WRITEFILE 5 // NEW
+```
+<!-- embed:end -->
+<!-- embed:file="user.c" line="39-44" lock="true" -->
+[Source: user.c](user.c#L39-L44)
+```c
+int readfile(const char *filename, char *buf, int len){
+    return syscall(SYS_READFILE, (int) filename, (int)buf, len);
+}
+int writefile(const char *filename, const char *buf, int len){
+    return syscall(SYS_WRITEFILE, (int) filename, (int)buf, len);
+}
+```
+<!-- embed:end -->
+
+<!-- embed:file="user.h" line="9-10" -->
+[Source: user.h](user.h#L9-L10)
+```c
+int readfile(const char *filename, char *buf, int len);
+int writefile(const char *filename, const char *buf, int len);
+```
+<!-- embed:end -->
+
+Sarebbe interessante leggere il design delle chiamate di sistema nei sistemi operativi general porpose e confrontare ciò che è stato omesso qui. Ad esempio, perché le syscalls `read` e `write` in Linux prendono come argomento i descrittori dei file e non i nomi dei file?
+
+I motivi sono tanti, che abbiamo trascurato, come:
+
+- Astrazione: tutto è un file per Linux
+- Prestazioni: path resolution
+- Gestione dello stato: ad esempio l'offset all'interno di un file durante la lettura o scrittura
+- Sicurezza: evita alcune vulnerabilità che potrebbero esser sfruttate per ottenere dati sensibili.
+
+### implemente system calls
+
+Implementiamo le chiamate di sistema che abbiamo definito nella sezione precedente.
+
+<!-- embed:file="kernel.c" line="820-843" lock="true" -->
+[Source: kernel.c](kernel.c#L820-L843)
+```c
+case SYS_READFILE:
+case SYS_WRITEFILE: {
+	const char *filename = (const char *) f->a0;
+	char *buf = (char *) f->a1;
+	int len = (int) f->a2;
+	struct file *file = fs_lookup(filename);
+	if (!file) {
+		printf("file not found %s\n", filename);
+		f->a0 = -1;
+		break;
+	}
+	if (len > (int) sizeof(file->data));
+		len = file->size;
+	if (f->a3 == SYS_WRITEFILE){
+		memcpy(file->data, buf, len);
+		file->size = len;
+		fs_flush();
+	}else{
+		memcpy(buf, file->data, len);
+	}
+
+	f->a0 = len;
+	break;
+}
+```
+<!-- embed:end -->
+
+Le operazioni di lettura e scrittura del file sono per lo più le stesse, quindi sono raggruppate nello stesso posto. La funzione `fs_lookup` cerca una entry in `files` basandosi sul nome del file. Per la lettura, legge i dati della entry, mentre per la scrittura modifica il contenuto della entry.
+
+Infine, la funzione `fs_flush` scrive sul disco.
+
+> Per semplicità, stiamo facendo riferimento diretto ai puntatori passati dalle applicazioni (alias *user pointers*), ma questo comporta problemi di sicurezza. Se gli utenti possono specificare aree di memoria arbitrarie, potrebbero leggere e scrivere aree di memoria del kernel tramite chiamte di sistema.
+
+### file read/write commands
+
+Proviamo a leggere e scrivere file dalla shell. Dato che la shell non implementa il parsing (l'analisi) degli argomenti da riga di comando, per il momento implementiamo i comandi `readfile` e `writefile` che leggeranno e scriveranno su un file *hardcoded* (predefinito nel codice) chiamato "hello.txt".
+
+<!-- embed:file="application/shell.c" line="32-39" lock="true"-->
+[Source: application/shell.c](application/shell.c#L32-L39)
+```c
+}else if(strcmp(cmdline, "readfile") == 0){
+    char buf[128];
+    int len = readfile("hello.txt", buf, sizeof(buf));
+    buf[len] = '\0';
+    printf("%s\n", buf);
+}else if (strcmp(cmdline, "writefile") == 0){
+    writefile("hello.txt", "Hello from shell!\n", 19);
+}
+```
+<!-- embed:end -->
+
+È facile ma causa errori di pagina:
+
+```bash
+> readfile
+PANIC: kernel.c:792: unexpected trap scause=0000000d, stval=1000041a, sepc=8020146e
+```
+
+Approfondiamo la causa. Secondo `llvm-objdump`, ciò avviene nella funzione `strcmp`:
+
+```bash
+80201466 <strcmp>:
+80201466: 00054603      lbu     a2, 0x0(a0)
+8020146a: ca19          beqz    a2, 0x80201480 <strcmp+0x1a>
+8020146c: 0505          addi    a0, a0, 0x1
+8020146e: 0005c683      lbu     a3, 0x0(a1)  <-- page fault here
+80201472: 00d61763      bne     a2, a3, 0x80201480 <strcmp+0x1a>
+80201476: 00054603      lbu     a2, 0x0(a0)
+8020147a: 0585          addi    a1, a1, 0x1
+8020147c: 0505          addi    a0, a0, 0x1
+8020147e: fa65          bnez    a2, 0x8020146e <strcmp+0x8>
+80201480: 0005c503      lbu     a0, 0x0(a1)
+80201484: 40a60533      sub     a0, a2, a0
+80201488: 8082          ret
+```
+
+Controlliamo il contenuto della tabella delle pagine nel monitor QEMU, la pagina a `1000041a` (con `vaddr = 01000000`) viene effettivamente mappata come una pagina utente (`u`) con permessi di lettura, scrittura ed esecuzione (`rwx`).
+
+```bash
+QEMU 10.1.3 monitor - type 'help' for more information
+(qemu) info mem
+vaddr    paddr            size     attr
+-------- ---------------- -------- -------
+10000000 000000008026c000 00001000 rwxu-a-
+...
+```
+
+Facciamo un dump della memoria all'indirizzo virtuale.
+
+```bash
+> QEMU 10.1.3 monitor - type 'help' for more information
+(qemu) x /10c 0x1000041a
+1000041a: 'h' 'e' 'l' 'l' 'o' '.' 't' 'x' 't' '\x00' '0' '1' '2' '3' '4' '5'
+1000042a: '6' '7' '8' '9' 'a' 'b' 'c' 'd' 'e' 'f' '\x00' 'e' 'x' 'i' 't' '\x00'
+1000043a: 'w' 'r' 'i' 't' 'e' 'f' 'i' 'l'
+(qemu) q
+```
+
+In RISC-V, il comportamento della Modalità S (kernel) può essere configurato tramite `sstatus` (CSR), incluso il bit SUM (allow Supervisor Memory access). Quando SUM non è impostato, i programmi S-Mode (cioè il kernel) non possono accedere alle pagine U-Mode (utente).
+
+Questa è una misura si sicurezza per preverire riferimenti involontari alle aree di memoria dell'utente. A proposito, anche le CPU Intel hanno la stessa funzione chiamata "SMAP" (Supervisor Mode Access Prevention).
+
+Definiamo la posizione del bit `SUM`:
+
+<!-- embed:file="kernel.h" line="136-136" lock="true" -->
+[Source: kernel.h](kernel.h#L136-L136)
+```c
+#define SSTATUS_SUM (1 << 18)
+```
+<!-- embed:end -->
+
+Tutto ciò che dobbiamo fare è impostare il bit `SUM` permettendoci di entrare nello spazio utente.
+
+<!-- embed:file="kernel.c" line="503-514" new="511" withLineNumbers="true" lock="true" -->
+[Source: kernel.c](kernel.c#L503-L514)
+```c
+503: __attribute__((naked)) // IMPORTANT
+504: void user_entry(void){
+505: 	__asm__ __volatile__(
+506: 		"csrw sepc, %[sepc]\n"
+507: 		"csrw sstatus, %[sstatus]\n"
+508: 		"sret \n"
+509: 		:
+510: 		: [sepc] "r" (USER_BASE),
+511: 			[sstatus] "r" (SSTATUS_SPIE | SSTATUS_SUM) // NEW
+512: 	);
+513: 	
+514: }
+```
+<!-- embed:end -->
+
+
+
 
 
 

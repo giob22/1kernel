@@ -1,6 +1,41 @@
 #pragma once
 #include "common.h"
 
+//* file system macro and struct
+
+#define FILES_MAX 2
+#define DISK_MAX_SIZE align_up(sizeof(struct file) * FILES_MAX, SECTOR_SIZE)
+
+struct tar_header {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char type;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char padding[12];
+    char data[]; // array pointing to the data area following the header. È un array a lunghezza variabile.
+}__attribute__((packed));
+
+struct file {
+    bool in_use;    // indica se il file entry è in uso o meno
+    char name[100]; // file name
+    char data[1024]; // contenuto del file
+    size_t size; // dimensione del file
+};
+
+
+
 //* disk I/O macro and struct
 
 #define SECTOR_SIZE 512
@@ -98,6 +133,7 @@ struct virtio_blk_req {
 
 #define USER_BASE 0x10000000
 #define SSTATUS_SPIE (1 << 5)
+#define SSTATUS_SUM (1 << 18)
 
 extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
 
