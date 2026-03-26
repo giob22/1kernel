@@ -1621,7 +1621,8 @@ Cosa fanno i comandi che abbiamo utilizzato:
 
 ### transition to user mode
 
-Per eseguire applicazioni, utilizziamo una modalità della CPU chiamata *user mode*, o in termini di RISC-V, *U-mode*. Passare alla modalità *U* è molto facile:
+Per eseguire applicazioni, utilizziamo una modalità della CPU chiamata *user mode*, o in termini di RISC-V, *U-mode*. \
+Per passare alla modalità *U* è molto facile:
 
 <!-- embed:file="kernel.h" line="11-11" lock="true"-->
 [Source: kernel.h](kernel.h#L11-L11)
